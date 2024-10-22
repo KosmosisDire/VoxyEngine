@@ -59,6 +59,7 @@ public class SSAORenderer : IDisposable
                 (float)(rand.NextDouble() * 2.0 - 1.0),
                 (float)(rand.NextDouble())
             );
+            
             sample = Vector3.Normalize(sample);
             sample *= (float)rand.NextDouble();  // Scale between 0 and 1
             float scale = (float)i / SSAO_KERNEL_SIZE;

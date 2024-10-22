@@ -19,7 +19,8 @@ const float bias = 0.1;           // Bias to prevent self-shadowing
 
 void main()
 {
-
+    FragColor = 1;
+    return;
     vec2 noiseScale = vec2(resolution.x / 4.0, resolution.y / 4.0); // scale noise (smaller for higher resolution)
 
     // get input for SSAO algorithm

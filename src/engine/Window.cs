@@ -18,6 +18,10 @@ public class Window
 
     public IWindow SilkWindow => window;
 
+    private float fps;
+    public float FPS => fps;
+
+
     
     public void OnRender(Action<double> action)
     {
@@ -39,7 +43,7 @@ public class Window
         }
 
         WindowOptions options = WindowOptions.Default;
-        options.Size = new Vector2D<int>(800, 600);
+        options.Size = new Vector2D<int>(1080, 1080);
         options.Title = "1.2 - Drawing a Quad";
 
         window = SilkWindowObj.Create(options);
@@ -54,12 +58,7 @@ public class Window
 
         window.Load += () =>
         {
-            // gl.Disable(GLEnum.Blend);
-            // gl.BlendFunc(GLEnum.SrcAlpha, GLEnum.OneMinusSrcAlpha);
-            // gl.Disable(GLEnum.DepthTest);
-            gl.ClearColor(0.2f,0.3f,0.3f, 1.0f);
-            // gl.Disable(GLEnum.CullFace);
-            // gl.CullFace(GLEnum.Back);
+            gl.ClearColor(0,0,0,1.0f);
             gl.Viewport(0, 0, (uint)options.Size.X, (uint)options.Size.Y);
         };
     }
@@ -75,6 +74,9 @@ public class Window
 
     protected void Render(double deltaTime)
     {
+        var instantFPS = 1.0 / deltaTime;
+        fps = (float)((fps * 0.99f) + (instantFPS * 0.01f));
+
         while (context.renderQueue.TryDequeue(out var action))
         {
             action.Invoke(deltaTime, gl);
