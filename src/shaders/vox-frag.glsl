@@ -6,7 +6,7 @@ layout(location = 2) out vec4 FragPosition;  // Normal output
 
 layout(std430, binding = 0) buffer positionsBuffer { vec4 positions[]; }; // w is size
 layout(std430, binding = 1) buffer materialsBuffer { int materials[]; };
-layout(std430, binding = 2) buffer lightLevelsBuffer { float lightLevels[]; };
+layout(std430, binding = 2) buffer lightLevelsBuffer { vec4 lightLevels[]; };
 layout(std430, binding = 3) buffer colorsBuffer { vec4 colors[]; };
 
 uniform sampler2D ssaoTexture;
@@ -20,7 +20,8 @@ uniform float near;
 uniform float far;
 uniform int octreeNodeCount;
 uniform int maxTreeDepth;
-uniform vec3 sun_dir;
+uniform vec3 sunDir;
+uniform vec3 sunColor;
 uniform float voxelSize;
 uniform int chunkSize;
 
@@ -34,8 +35,10 @@ const float HALF_PI = 1.57079632679;
 vec3 background(vec3 d)
 {
     const float sun_intensity = 1.0;
-    vec3 sun = (pow(max(0.0, dot(d, sun_dir)), 48.0) + pow(max(0.0, dot(d, sun_dir)), 4.0) * 0.25) * sun_intensity * vec3(1.0, 0.85, 0.5);
-    vec3 sky = mix(vec3(0.6, 0.65, 0.8), vec3(0.15, 0.25, 0.65), d.y) * 1.15;
+    vec3 sun = (pow(max(0.0, dot(d, sunDir)), 48.0) + pow(max(0.0, dot(d, sunDir)), 4.0) * 0.25) * sun_intensity * vec3(1.0, 0.85, 0.5);
+    // vec3 sky = mix(vec3(0.6, 0.65, 0.8), vec3(0.15, 0.25, 0.65), d.y) * 1.15;
+    float sunHeight = dot(vec3(0,1,0), sunDir);
+    vec3 sky = mix(mix(sunColor, vec3(0.6, 0.65, 0.8), sunHeight), vec3(0.15, 0.25, 0.65), d.y) * 1.15;
     return sun + sky;
 }
 
@@ -62,14 +65,9 @@ bool intersectBox(vec3 origin, vec3 invDir, vec3 boxMin, vec3 boxMax, out float 
 
 int getIndexFromPosition(vec3 position)
 {
-    position /= voxelSize;
-    int result =  int(position.x + position.y * chunkSize + position.z * chunkSize * chunkSize);
+    if (min3(position) < 0 || max3(position) >= chunkSize) return -1;
 
-    if (result < 0 || result >= chunkSize*chunkSize*chunkSize)
-    {
-        return -1;
-    }
-
+    int result =  int(position.x) + int(position.y) * int(chunkSize) + int(position.z) * int(chunkSize) * int(chunkSize);
     return result;
 }
 
@@ -102,11 +100,11 @@ int rayOctreeIntersection(vec3 origin, vec3 dir, float maxDist, out vec3 hitPoin
 
         steps++;
 
-        int dataIndex = getIndexFromPosition(position);
-        int material = materials[dataIndex];
-
         if (leaf)  // Hit a leaf node
         {
+            int dataIndex = getIndexFromPosition(position / voxelSize);
+            int material = materials[dataIndex];
+
             if (material == 0) continue;  // Empty voxel
 
             // Calculate the hit point only once upon intersection
@@ -132,7 +130,6 @@ int rayOctreeIntersection(vec3 origin, vec3 dir, float maxDist, out vec3 hitPoin
         {
             int firstChildIndex = current * 8 + 1;
 
-            // Precompute child order in a more efficient manner without sign() calls
             int childOrder = (dir.x > 0.0 ? 1 : 0) | (dir.y > 0.0 ? 2 : 0) | (dir.z > 0.0 ? 4 : 0);
 
             for (int i = 0; i < 8; ++i) {
@@ -145,65 +142,66 @@ int rayOctreeIntersection(vec3 origin, vec3 dir, float maxDist, out vec3 hitPoin
 }
 
 
-bool ray(vec3 p, vec3 d, out vec3 color, out vec3 normal, out float depth, out vec3 position)
+bool ray(vec3 p, vec3 d, out vec3 color)
 {
     vec3 ambient_color = vec3(0.5, 0.5, 0.7);
-    const vec3 sun_color = vec3(0.7, 0.5, 0.5);
     const float view_distance = 500.0;
     vec3 fog_color = background(d);
 
     vec3 hitPoint;
+    vec3 normal;
     int steps;
     int hit = rayOctreeIntersection(p, d, view_distance, hitPoint, normal, steps);
 
     if (hit != -1)
     {
-        // vec3 voxelPosition = positions[hit].xyz;
-        // int dataIndex = getIndexFromPosition(voxelPosition);
+        vec3 voxelPos = positions[hit].xyz;
+        int dataIndex = getIndexFromPosition(voxelPos / voxelSize);
 
-        // block infront of hit
-        // int faceAdjacentIndex = getIndexFromPosition(floor(hitPoint + (normal * voxelSize * 0.1)));
-        // if (faceAdjacentIndex == -1) faceAdjacentIndex = hit;
-        // float lightLevel = lightLevels[faceAdjacentIndex];
-
-        // Calculate the distance from the origin to the hitPoint for depth
-        // position = (view * vec4(hitPoint, 1.0)).xyz;
         float dist = length(hitPoint - p);
-        // depth = dist;
-
         float fog_factor = min(1.0, dist * dist / (view_distance * view_distance));
-        // fog_factor *= lightLevel;
-        // float sun_factor = max(0.0, dot(normal, sun_dir));
-        float sun_factor = 1.0;
 
-        // Shadow calculation (optional)
-        // if (sun_factor > 0) 
-        // {
-        //     vec3 shadowHitPoint, shadowNormal;
-        //     int stepsShadow;
-        //     int shadowHit = rayOctreeIntersection(hitPoint + normal * 0.001, normalize(sun_dir), 50, shadowHitPoint, shadowNormal, stepsShadow);
+        vec3 diffuse = colors[dataIndex].xyz;
 
-        //     if (shadowHit != -1)
-        //     {
-        //         sun_factor = 0;
-        //     }
-        // }
- 
-        // float ambient_factor = 0.5 * lightLevel;
-        float ambient_factor = 0.5;
-        vec3 texel = vec3(0.5);
-        vec3 diffuse = texel;
-        vec3 c = diffuse * (ambient_factor * ambient_color + sun_factor * sun_color);
+        // light level per face
+        // find adjacent air voxel
+        int adjIndex = getIndexFromPosition((hitPoint / voxelSize) + normal * voxelSize * 0.5);
+        vec4 lightLevel = lightLevels[adjIndex];
+        if (adjIndex == -1) lightLevel = vec4(1.0);
 
-        color = mix(c, fog_color, fog_factor);
+        float sun = max(0.0, dot(normal, sunDir));
+
+        if (sun > 0.0)
+        {
+            // calculate shadow
+            vec3 shadowOrigin = hitPoint + normal * 0.001;
+            vec3 shadowDir = sunDir;
+            vec3 shadowHitPoint;
+            vec3 shadowNormal;
+            int shadowSteps;
+            int shadowHit = rayOctreeIntersection(shadowOrigin, shadowDir, view_distance, shadowHitPoint, shadowNormal, shadowSteps);
+
+            if (shadowHit != -1)
+            {
+                float shadowDist = length(shadowHitPoint - shadowOrigin);
+                if (shadowDist < length(shadowHitPoint - hitPoint))
+                {
+                    sun = 0.0;
+                }
+            }
+
+        }
+
+        vec3 c = diffuse * (ambient_color + sun) * lightLevel.w * sunColor + lightLevel.xyz;
+
+        color = mix(c, fog_color, fog_factor * (length(lightLevel.xyz) + lightLevel.w));
         // mix steps 
-        color = mix(vec3(color), vec3(float(steps) / 10.0), 0.1);
+        // color = mix(vec3(color), vec3(float(steps) / 50.0), 0.5);
         return true;
     }
 
-    // position = p + d * view_distance;
-    color = vec3(steps) / 10.0;
-    depth = far;
+    color = fog_color;
+    color = vec3(steps) / 50.0;
     return false;
 }
 
@@ -227,25 +225,7 @@ void main()
     vec3 origin = calculateRayOrigin();
     vec3 direction = calculateRayDirection(fragCoord);
 
-    // Calculate color and depth value
-    float depth;
-    vec3 normal;
     vec3 color;
-    vec3 position;
-    ray(origin, direction, color, normal, depth, position);
-    
-    // Normalize the depth value between 0 and 1
-    float normalizedDepth = (depth - near) / (far - near);
-    
-    // Write to depthTexture
-    gl_FragDepth = normalizedDepth;
-    // Apply simple tone mapping for color
-    color = color / (color + vec3(1.0));
-    color = pow(color, vec3(1.0 / 2.2)); // Gamma correction
-    // float ssaoFactor = texture(ssaoTexture, TexCoords).r;
-    // color *= ssaoFactor; // Apply SSAO factor
-    
+    ray(origin, direction, color);
     FragColor = vec4(color, 1.0);
-    FragNormal = vec4(normal, 1.0);
-    FragPosition = vec4(position, 1.0);
 }

@@ -1,39 +1,39 @@
+using System.Collections.Concurrent;
 using System.Numerics;
-using Engine;
-using ILGPU.Util;
 namespace VoxelEngine;
-
 
 public class OctreeGenerator
 {
-    public readonly float voxelSize = 0.25f;
+    public readonly float voxelSize = 0.5f;
     public int NodeCount { get; private set; }
     public int LeafCount { get; private set; }
     public int ChunkSize { get; private set; }
     public int ChunkWidth { get; private set; }
 
-    public Float4[] positions; // xyz: position, w: size
-
+    public Vector4[] positions;
     public int[] materials;
-    public float[] lightLevels;
-    public Float4[] colors;
+    public Vector4[] lightLevels;
+    public Vector4[] colors;
 
+    private readonly TerrainGenerator generator;
+    
     public OctreeGenerator(int chunkSize)
     {
         ChunkWidth = (int)(chunkSize * voxelSize);
         ChunkSize = chunkSize;
         NodeCount = CalculateNodeCount(ChunkWidth);
         LeafCount = CalculateLeafCount(ChunkWidth);
-        
 
         Console.WriteLine($"Node count: {NodeCount}");
         Console.WriteLine($"Leaf count: {LeafCount}");
 
-        positions = new Float4[NodeCount + 1];
+        // Initialize arrays
+        positions = new Vector4[NodeCount];
+        materials = new int[LeafCount];
+        lightLevels = new Vector4[LeafCount];
+        colors = new Vector4[LeafCount];
 
-        materials = new int[LeafCount + 1];
-        lightLevels = new float[LeafCount + 1];
-        colors = new Float4[LeafCount + 1];
+        generator = new TerrainGenerator(seed: 12);
     }
 
     private int CalculateNodeCount(int chunkWidth)
@@ -56,7 +56,35 @@ public class OctreeGenerator
 
     public void GenerateOctree(Vector3 chunkPosition)
     {
-        BuildOctreeRecursive(new Vector3(chunkPosition.X, chunkPosition.Y, chunkPosition.Z), ChunkWidth);
+        var startTime = DateTime.Now;
+        int nodeCounter = 0;
+        int leafCounter = 0;
+
+        // Divide the chunk into subregions for parallel processing
+        int subregionSize = ChunkWidth / 2; // Split into 8 major subregions
+        var tasks = new Task[8];
+
+        for (int i = 0; i < 8; i++)
+        {
+            Vector3 offset = childOffsets[i] * subregionSize;
+            Vector3 subregionPos = chunkPosition + offset;
+            int baseIndex = i + 1;  // Root is at 0, children start at 1
+
+            tasks[i] = Task.Run(() =>
+            {
+                BuildOctreeSubregion(subregionPos, subregionSize, baseIndex, ref nodeCounter, ref leafCounter);
+            });
+        }
+
+        // Set root node
+        positions[0] = new Vector4(chunkPosition.X, chunkPosition.Y, chunkPosition.Z, ChunkWidth);
+        Interlocked.Increment(ref nodeCounter);
+
+        Task.WaitAll(tasks);
+
+        var endTime = DateTime.Now;
+        Console.WriteLine($"Parallel octree generation took {(endTime - startTime).TotalMilliseconds} ms");
+        Console.WriteLine($"Octree nodes: {nodeCounter}, leaves: {leafCounter}");
     }
 
     private static readonly Vector3[] childOffsets = [
@@ -70,91 +98,42 @@ public class OctreeGenerator
         new Vector3(1, 1, 1)
     ];
 
-    public int GetIndexFromPosition(Vector3 position)
+    private void BuildOctreeSubregion(Vector3 position, float size, int index, ref int nodeCounter, ref int leafCounter)
     {
-        position = position / voxelSize;
-        return (int)(position.X + position.Y * ChunkSize + position.Z * ChunkSize * ChunkSize);
-    }
-
-    private void BuildOctreeRecursive(Vector3 position, float size, int index = 0)
-    {
-        positions[index] = new Float4(position.X, position.Y, position.Z, size);
+        positions[index] = new Vector4(position.X, position.Y, position.Z, size);
+        Interlocked.Increment(ref nodeCounter);
 
         float childSize = size / 2.0f;
         if (childSize < voxelSize)
         {
             int dataIndex = GetIndexFromPosition(position);
-            materials[dataIndex] = GetNoiseAt(position);
-            lightLevels[dataIndex] = 0.0f;
-            colors[dataIndex] = new Float4(1, 1, 1, 1);
-            positions[index] = new Float4(position.X, position.Y, position.Z, -size);
+            var (material, color) = generator.GetTerrainAt(position, ChunkWidth);
+            
+            materials[dataIndex] = material;
+            colors[dataIndex] = color;
+            lightLevels[dataIndex] = new Vector4(0);
+            positions[index] = new Vector4(position.X, position.Y, position.Z, -size);
+            
+            Interlocked.Increment(ref leafCounter);
             return;
         }
 
-        bool allEmpty = true;
         for (int i = 0; i < 8; i++)
         {
             Vector3 offset = childOffsets[i] * childSize;
             Vector3 childPosition = position + offset;
+            int childIndex = index * 8 + 1 + i;
 
-            var childIndex = index * 8 + 1 + i;
-            BuildOctreeRecursive(childPosition, childSize, childIndex);
-
-            if (positions[childIndex].W > 0)
-            {
-                allEmpty = false;
-            }
-            else
-            {
-                int childDataIndex = GetIndexFromPosition(childPosition);
-                if (materials[childDataIndex] > 0)
-                {
-                    allEmpty = false;
-                }
-            }
-
-            // // also make it not all empty if one of the children is a leaf which is adjacent to a solid leaf
-            // if (allEmpty)
-            // {
-            //     for (int j = 0; j < 8; j++)
-            //     {
-            //         Vector3 adjacentOffset = childOffsets[j] * childSize;
-            //         Vector3 adjacentPosition = childPosition + adjacentOffset;
-            //         int adjacentDataIndex = GetIndexFromPosition(adjacentPosition);
-            //         if (adjacentDataIndex < 0 || adjacentDataIndex >= materials.Length)
-            //         {
-            //             continue;
-            //         }
-            //         if (materials[adjacentDataIndex] > 0)
-            //         {
-            //             allEmpty = false;
-            //             break;
-            //         }
-            //     }
-            // }
-        }
-
-        if (allEmpty)
-        {
-            positions[index] = new Float4(position.X, position.Y, position.Z, -size);
+            BuildOctreeSubregion(childPosition, childSize, childIndex, ref nodeCounter, ref leafCounter);
         }
     }
 
-    private int GetNoiseAt(Vector3 position)
+    public int GetIndexFromPosition(Vector3 position)
     {
-        // var chunkCenter = new Vector3(ChunkWidth / 2, ChunkWidth / 2, ChunkWidth / 2);
-        // var distance = Vector3.Distance(position, chunkCenter);
-        // if (distance > ChunkWidth / 2)
-        // {
-        //     return 0;
-        // }
-
-        float nx = position.X * 0.1f;
-        float ny = position.Y * 0.1f;
-        float nz = position.Z * 0.1f;
-        var noise = Perlin.Noise(nx, ny, nz);
-        return noise > 0.001f ? 1 : 0;
+        var divPosition = new Vector3(position.X / voxelSize, position.Y / voxelSize, position.Z / voxelSize);
+        uint xOff = (uint)divPosition.X;
+        uint yOff = (uint)divPosition.Y * (uint)ChunkSize;
+        uint zOff = (uint)divPosition.Z * (uint)ChunkSize * (uint)ChunkSize;
+        return (int)(xOff + yOff + zOff);
     }
-    
-
 }

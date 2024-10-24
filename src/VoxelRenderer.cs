@@ -1,16 +1,24 @@
-using System;
 using System.Numerics;
 using Engine;
-using ILGPU.Util;
-using Silk.NET.Maths;
 using Silk.NET.OpenGL;
 using Shader = Engine.Shader;
+
 namespace VoxelEngine;
 
 public class VoxelRenderer : IDisposable
 {
-    private OctreeGenerator octreeGenerator;
-    private GPULightingCalculator lightingCalculator;
+    private uint directLightingProgram;
+    private uint blurProgram;
+
+
+    private uint sandPhysicsProgram;
+    private uint moveFlags;
+    private uint currentFrame = 0;
+
+
+    private uint octreeOptimizeProgram;
+    private uint changesBuffer;
+    private int[] changesArray = new int[1];
 
     private uint positionsBuffer;
     private uint materialsBuffer;
@@ -30,7 +38,13 @@ public class VoxelRenderer : IDisposable
 
     public int chunksize;
 
+    Vector3 sunDirection = new Vector3(0.7f, 0.5f, 0.5f);
+    Vector3 sunColor = new Vector3(1, 0.9f, 1);
 
+    private uint framebuffer;
+    private uint colorTexture, normalTexture, depthTexture, positionTexture;
+
+    private OctreeGenerator octreeGenerator;
 
     public unsafe VoxelRenderer(Window window, Camera camera, int chunkSize)
     {
@@ -38,9 +52,8 @@ public class VoxelRenderer : IDisposable
         this.window = window;
         this.camera = camera;
         this.chunksize = chunkSize;
-        octreeGenerator = new OctreeGenerator(chunkSize);
-        lightingCalculator = new GPULightingCalculator(octreeGenerator);
 
+        octreeGenerator = new OctreeGenerator(chunkSize);
 
         screenQuad = MeshGen.Quad(ctx);
         screenQuad.CreateFlattenedBuffers();
@@ -56,6 +69,24 @@ public class VoxelRenderer : IDisposable
 
         ctx.ExecuteCmd((dt, gl) =>
         {
+            // Initialize compute shaders
+            directLightingProgram = CreateComputeShader(gl, "shaders/lighting.comp.glsl");
+            blurProgram = CreateComputeShader(gl, "shaders/lighting-blur.comp.glsl");
+            sandPhysicsProgram = CreateComputeShader(gl, "shaders/falling.comp.glsl");
+            octreeOptimizeProgram = CreateComputeShader(gl, "shaders/octree-optimize.comp.glsl");
+
+            // changes buffer for octree optimization
+            gl.GenBuffers(1, out changesBuffer);
+            gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, changesBuffer);
+            gl.BufferData(BufferTargetARB.ShaderStorageBuffer, sizeof(int), null, BufferUsageARB.DynamicCopy);
+
+            // move flags for sand physics
+            gl.GenBuffers(1, out moveFlags);
+            gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, moveFlags);
+            gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(leafCount * sizeof(int)), null, BufferUsageARB.DynamicCopy);
+
+
+            // Create buffers
             var buffers = new uint[4];
             gl.GenBuffers(4, buffers);
             positionsBuffer = buffers[0];
@@ -68,10 +99,10 @@ public class VoxelRenderer : IDisposable
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, materialsBuffer);
             gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(leafCount * sizeof(int)), null, BufferUsageARB.DynamicDraw);
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, lightLevelsBuffer);
-            gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(leafCount * sizeof(float)), null, BufferUsageARB.DynamicDraw);
+            gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(leafCount * sizeof(float) * 4), null, BufferUsageARB.DynamicDraw);
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, colorsBuffer);
             gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(leafCount * sizeof(float) * 4), null, BufferUsageARB.DynamicDraw);
-            
+
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, 0);
 
             CreateFramebuffer(gl);
@@ -88,23 +119,46 @@ public class VoxelRenderer : IDisposable
         window.SilkWindow.Update += (dt) =>
         {
             // move sun in a circle
-            // sunDirection = Vector3.Transform(sunDirection, Matrix4x4.CreateRotationY(0.01f));
+            sunDirection = Vector3.Transform(sunDirection, Matrix4x4.CreateRotationY(0.001f));
         };
-
-        // new Thread(LightingThread).Start();
     }
 
-    void LightingThread()
+    private unsafe uint CreateComputeShader(GL gl, string path)
     {
-        while (true)
-        {
-            lightingCalculator.CalculateLighting(sunDirection);
-            UploadLighting();
-        }
-    }
+        uint shader = gl.CreateShader(ShaderType.ComputeShader);
+        string source = File.ReadAllText(path);
 
-    private uint framebuffer;   
-    private uint colorTexture, normalTexture, depthTexture, positionTexture;
+        // Add a #line directive to help debugger find the source file
+        // source = $"#line 1 \"{Path.GetFileName(path)}\"\n" + source;
+
+        gl.ShaderSource(shader, source);
+        gl.CompileShader(shader);
+
+
+        gl.GetShader(shader, ShaderParameterName.CompileStatus, out int status);
+        if (status != (int)GLEnum.True)
+        {
+            throw new Exception($"Failed to compile compute shader: {gl.GetShaderInfoLog(shader)}");
+        }
+
+        uint program = gl.CreateProgram();
+
+        gl.AttachShader(program, shader);
+        gl.LinkProgram(program);
+
+        // Enable debug output
+        gl.Enable(EnableCap.DebugOutput);
+        gl.Enable(EnableCap.DebugOutputSynchronous);
+
+        gl.GetProgram(program, ProgramPropertyARB.LinkStatus, out status);
+        if (status != (int)GLEnum.True)
+        {
+            throw new Exception($"Failed to link compute shader: {gl.GetProgramInfoLog(program)}");
+        }
+
+        gl.DeleteShader(shader);
+        return program;
+    }
 
     private unsafe void CreateFramebuffer(GL gl)
     {
@@ -149,7 +203,7 @@ public class VoxelRenderer : IDisposable
         GLEnum[] drawBuffers = { GLEnum.ColorAttachment0, GLEnum.ColorAttachment1, GLEnum.ColorAttachment2 };
         fixed (GLEnum* drawBuffersPtr = drawBuffers)
         {
-            gl.DrawBuffers(3, drawBuffersPtr);  // Tell OpenGL we are drawing to these color attachments
+            gl.DrawBuffers(3, drawBuffersPtr);
         }
 
         // Check framebuffer completeness
@@ -158,55 +212,186 @@ public class VoxelRenderer : IDisposable
             Console.WriteLine("Framebuffer not complete!");
         }
 
-        gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);  // Unbind framebuffer
+        gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
-    Vector3 sunDirection = new Vector3(0.7f, 0.5f, 0.5f);
- 
-    public unsafe void UpdateTerrain(Vector3 centerPosition)
+    int octreeOptimizeLevel = 0;
+    public unsafe void OptimizeOctree()
     {
-        Console.WriteLine($"Updating terrain centered at {centerPosition}");
-        octreeGenerator.GenerateOctree(centerPosition);
-        lightingCalculator.UploadOctreeData();
-        UploadTerrain();        
+        int maxDepth = (int)Math.Log2(octreeGenerator.ChunkSize);
+
+        ctx.ExecuteCmd((dt, gl) =>
+        {
+            var start = DateTime.Now;
+
+            gl.UseProgram(octreeOptimizeProgram);
+
+            // Set uniforms
+            gl.Uniform1(0, maxDepth);
+            gl.Uniform1(1, octreeGenerator.voxelSize);
+            gl.Uniform1(2, octreeOptimizeLevel); // Current level being processed
+            gl.Uniform1(3, octreeGenerator.ChunkSize);
+
+            // Bind buffers
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 0, positionsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 1, materialsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 2, lightLevelsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 3, colorsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 4, changesBuffer);
+
+            // Dispatch compute shader
+            const int COMPUTE_GROUP_SIZE = 512;
+            int numWorkGroups = (nodeCount + COMPUTE_GROUP_SIZE - 1) / COMPUTE_GROUP_SIZE;
+            gl.DispatchCompute((uint)numWorkGroups, 1, 1);
+
+            // Memory barrier
+            gl.MemoryBarrier(MemoryBarrierMask.ShaderStorageBarrierBit);
+
+            octreeOptimizeLevel = (octreeOptimizeLevel + 1) % (maxDepth + 1);
+
+            var end = DateTime.Now;
+            Console.WriteLine($"Octree optimization took {(end - start).TotalMilliseconds}ms");
+        });
     }
 
-    private unsafe void UploadLighting()
+
+    // Update the physics simulation method
+    public unsafe void UpdatePhysics(double deltaTime, Vector3 gravity)
     {
         ctx.ExecuteCmd((dt, gl) =>
         {
-            gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, lightLevelsBuffer);
-            gl.BufferSubData(GLEnum.ShaderStorageBuffer, 0, (nuint)(octreeGenerator.LeafCount * sizeof(float)), (ReadOnlySpan<float>)octreeGenerator.lightLevels);
+            var start = DateTime.Now;
+            // Clear move flags buffer at the start of each frame
+            gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, moveFlags);
+            gl.ClearBufferData(GLEnum.ShaderStorageBuffer, GLEnum.R8i, GLEnum.RedInteger, GLEnum.Int, null);
+
+            gl.UseProgram(sandPhysicsProgram);
+
+            // Set uniforms
+            gl.Uniform1(0, octreeGenerator.ChunkSize);
+            gl.Uniform1(1, (float)deltaTime);
+            gl.Uniform1(2, currentFrame++);
+            gl.Uniform3(3, Vector3.Normalize(gravity)); // Ensure gravity is normalized
+
+            // Bind buffers - note the new moveFlags buffer at binding point 4
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 1, materialsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 2, lightLevelsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 3, colorsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 4, moveFlags);
+
+            // Dispatch compute shader
+            const int COMPUTE_GROUP_SIZE = 512;
+            int numWorkGroups = (octreeGenerator.LeafCount + COMPUTE_GROUP_SIZE - 1) / COMPUTE_GROUP_SIZE;
+            gl.DispatchCompute((uint)numWorkGroups, 1, 1);
+
+            // Memory barrier to ensure physics completes before rendering
+            gl.MemoryBarrier(MemoryBarrierMask.ShaderStorageBarrierBit);
+            var end = DateTime.Now;
+            Console.WriteLine($"Physics update took {(end - start).TotalMilliseconds}ms");
+        });
+    }
+
+    public void CalculateLighting()
+    {
+        ctx.ExecuteCmd((dt, gl) =>
+        {
+            var start = DateTime.Now;
+            // Direct lighting pass
+            gl.UseProgram(directLightingProgram);
+
+            gl.Uniform3(0, sunDirection);
+            gl.Uniform4(1, new float[] { sunColor.X, sunColor.Y, sunColor.Z, 1.0f });
+            gl.Uniform1(2, octreeGenerator.ChunkSize);
+            gl.Uniform1(3, octreeGenerator.voxelSize);
+            gl.Uniform1(4, (uint)DateTime.UtcNow.Ticks);
+            gl.Uniform3(5, camera.Position);
+
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 0, positionsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 1, materialsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 2, lightLevelsBuffer);
+            gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 3, colorsBuffer);
+
+            const uint GROUP_SIZE = 8;
+            uint numWorkGroups = (uint)octreeGenerator.ChunkSize / GROUP_SIZE;
+            gl.DispatchCompute(numWorkGroups, numWorkGroups, numWorkGroups);
+
+            // Blur pass
+            gl.UseProgram(blurProgram);
+
+            gl.Uniform1(0, octreeGenerator.ChunkSize);
+            gl.Uniform1(1, octreeGenerator.voxelSize);
+
+            gl.Uniform1(2, 0);
+            gl.DispatchCompute(numWorkGroups, numWorkGroups, numWorkGroups);
+            gl.MemoryBarrier(MemoryBarrierMask.ShaderStorageBarrierBit);
+
+            gl.Uniform1(2, 1);
+            gl.DispatchCompute(numWorkGroups, numWorkGroups, numWorkGroups);
+            gl.MemoryBarrier(MemoryBarrierMask.ShaderStorageBarrierBit);
+
+            gl.Uniform1(2, 2);
+            gl.DispatchCompute(numWorkGroups, numWorkGroups, numWorkGroups);
+            gl.MemoryBarrier(MemoryBarrierMask.ShaderStorageBarrierBit);
+
+            var end = DateTime.Now;
+            Console.WriteLine($"Lighting calculation took {(end - start).TotalMilliseconds}ms");
+        });
+    }
+
+    public void UpdateTerrain(Vector3 centerPosition)
+    {
+        Console.WriteLine($"Updating terrain centered at {centerPosition}");
+        octreeGenerator.GenerateOctree(centerPosition);
+        UploadTerrain();
+    }
+
+    private unsafe void UploadMaterials(int start, int count)
+    {
+        ctx.ExecuteCmd((dt, gl) =>
+        {
+            gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, materialsBuffer);
+            gl.BufferSubData(GLEnum.ShaderStorageBuffer, (nint)(start * sizeof(int)), (nuint)(count * sizeof(int)), new ReadOnlySpan<int>(octreeGenerator.materials, start, count));
+            gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, 0);
+        });
+    }
+
+    private unsafe void UploadColors(int start, int count)
+    {
+        ctx.ExecuteCmd((dt, gl) =>
+        {
+            gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, colorsBuffer);
+            gl.BufferSubData(GLEnum.ShaderStorageBuffer, (nint)(start * sizeof(float) * 4), (nuint)(count * sizeof(float) * 4), new ReadOnlySpan<Vector4>(octreeGenerator.colors, start, count));
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, 0);
         });
     }
 
     private unsafe void UploadTerrain()
     {
-        nodeCount = octreeGenerator.NodeCount;
-
+        Console.WriteLine($"Uploading terrain data to GPU, node count: {nodeCount}");
         ctx.ExecuteCmd((dt, gl) =>
         {
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, positionsBuffer);
-            gl.BufferSubData(GLEnum.ShaderStorageBuffer, 0, (nuint)(nodeCount * sizeof(float) * 4), (ReadOnlySpan<Float4>)octreeGenerator.positions);
+            gl.BufferSubData(GLEnum.ShaderStorageBuffer, 0, (nuint)(nodeCount * sizeof(float) * 4), (ReadOnlySpan<Vector4>)octreeGenerator.positions);
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, materialsBuffer);
             gl.BufferSubData(GLEnum.ShaderStorageBuffer, 0, (nuint)(octreeGenerator.LeafCount * sizeof(int)), (ReadOnlySpan<int>)octreeGenerator.materials);
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, lightLevelsBuffer);
-            gl.BufferSubData(GLEnum.ShaderStorageBuffer, 0, (nuint)(octreeGenerator.LeafCount * sizeof(float)), (ReadOnlySpan<float>)octreeGenerator.lightLevels);
+            gl.BufferSubData(GLEnum.ShaderStorageBuffer, 0, (nuint)(octreeGenerator.LeafCount * sizeof(float) * 4), (ReadOnlySpan<Vector4>)octreeGenerator.lightLevels);
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, colorsBuffer);
-            gl.BufferSubData(GLEnum.ShaderStorageBuffer, 0, (nuint)(octreeGenerator.LeafCount * sizeof(float) * 4), (ReadOnlySpan<Float4>)octreeGenerator.colors);
+            gl.BufferSubData(GLEnum.ShaderStorageBuffer, 0, (nuint)(octreeGenerator.LeafCount * sizeof(float) * 4), (ReadOnlySpan<Vector4>)octreeGenerator.colors);
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, 0);
         });
     }
 
-    public void Draw()
+    int counter = 0;
+    public void Draw(double dt)
     {
+        OptimizeOctree();
+        CalculateLighting();
+        // if (counter++ < 500)
+            // UpdatePhysics(dt, new Vector3(0, -1, 0));
+
         ctx.RenderCmd((dt, gl) =>
         {
-            // Step 1: Bind the framebuffer to render off-screen
-            // gl.BindFramebuffer(FramebufferTarget.Framebuffer, framebuffer);
-            // gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
-
             voxelShader.Use();
             voxelShader.SetUniform("time", (float)window.context.Time);
             voxelShader.SetUniform("resolution", window.Size);
@@ -215,55 +400,26 @@ public class VoxelRenderer : IDisposable
             voxelShader.SetUniform("projection", camera.PerspectiveMatrix);
             voxelShader.SetUniform("near", camera.Near);
             voxelShader.SetUniform("far", camera.Far);
-            voxelShader.SetUniform("sun_dir", sunDirection);
+            voxelShader.SetUniform("sunDir", sunDirection);
+            voxelShader.SetUniform("sunColor", sunColor);
             voxelShader.SetUniform("voxelSize", octreeGenerator.voxelSize);
             voxelShader.SetUniform("chunkSize", octreeGenerator.ChunkSize);
 
-            // Bind the octree data buffers to the shader storage buffer binding points
+            // Bind the octree data buffers
             gl.BindBufferBase(GLEnum.ShaderStorageBuffer, 0, positionsBuffer);
             gl.BindBufferBase(GLEnum.ShaderStorageBuffer, 1, materialsBuffer);
             gl.BindBufferBase(GLEnum.ShaderStorageBuffer, 2, lightLevelsBuffer);
             gl.BindBufferBase(GLEnum.ShaderStorageBuffer, 3, colorsBuffer);
-            
 
             // Set shader uniforms
             voxelShader.SetUniform("octreeNodeCount", nodeCount);
-            voxelShader.SetUniform("maxTreeDepth", 10);  // Adjust this based on your octree depth
-
-            //Bind the SSAO texture in texture unit 0
-            // voxelShader.SetUniform("ssaoTexture", 0);
-            // gl.ActiveTexture(TextureUnit.Texture0);
-            // gl.BindTexture(TextureTarget.Texture2D, ssaoTex);
+            voxelShader.SetUniform("maxTreeDepth", 10);
 
             // Render the scene to the framebuffer
+            // gl.BindFramebuffer(FramebufferTarget.Framebuffer, framebuffer);
+            // gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+
             screenQuad.Draw();
-
-            // Unbind the framebuffer
-            // gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-
-            // Step 2: Generate SSAO from depth texture
-            // ssaoTex = ssao.GenerateSSAO(positionTexture, normalTexture, camera.ViewMatrix, camera.PerspectiveMatrix);
-
-            // Step 3: Render the final scene to the screen
-            // texShader.Use();
-
-            // texShader.SetUniform("tex", 0);
-            // gl.ActiveTexture(TextureUnit.Texture0);
-            // gl.BindTexture(TextureTarget.Texture2D, colorTexture);
-
-            // Draw the final screen quad to display on screen
-            // screenQuad.Draw();
-        });
-    }
-
-
-    public void Dispose()
-    {
-        ctx.ExecuteCmd((dt, gl) =>
-        {
-            // Clean up OpenGL resources
-            gl.DeleteBuffers(4, new uint[] { positionsBuffer, materialsBuffer, lightLevelsBuffer, colorsBuffer });
-            DisposeFrameBuffer(gl);
         });
     }
 
@@ -272,27 +428,99 @@ public class VoxelRenderer : IDisposable
         if (depthTexture != 0)
         {
             gl.DeleteTextures(1, ref depthTexture);
+            depthTexture = 0;
         }
 
         if (colorTexture != 0)
         {
             gl.DeleteTextures(1, ref colorTexture);
+            colorTexture = 0;
         }
 
         if (normalTexture != 0)
         {
             gl.DeleteTextures(1, ref normalTexture);
+            normalTexture = 0;
         }
 
         if (positionTexture != 0)
         {
             gl.DeleteTextures(1, ref positionTexture);
+            positionTexture = 0;
         }
 
         if (framebuffer != 0)
         {
             gl.DeleteFramebuffers(1, ref framebuffer);
+            framebuffer = 0;
         }
     }
 
+    public void Dispose()
+    {
+        ctx.ExecuteCmd((dt, gl) =>
+        {
+            // Clean up compute shaders
+            if (directLightingProgram != 0)
+            {
+                gl.DeleteProgram(directLightingProgram);
+                directLightingProgram = 0;
+            }
+            if (blurProgram != 0)
+            {
+                gl.DeleteProgram(blurProgram);
+                blurProgram = 0;
+            }
+            if (sandPhysicsProgram != 0)
+            {
+                gl.DeleteProgram(sandPhysicsProgram);
+                sandPhysicsProgram = 0;
+            }
+            if (moveFlags != 0)
+            {
+                gl.DeleteBuffer(moveFlags);
+                moveFlags = 0;
+            }
+            // Add cleanup for octree optimization
+            if (octreeOptimizeProgram != 0)
+            {
+                gl.DeleteProgram(octreeOptimizeProgram);
+            }
+            if (changesBuffer != 0)
+            {
+                gl.DeleteBuffer(changesBuffer);
+            }
+
+            // Clean up buffers
+            if (positionsBuffer != 0)
+            {
+                gl.DeleteBuffer(positionsBuffer);
+                positionsBuffer = 0;
+            }
+            if (materialsBuffer != 0)
+            {
+                gl.DeleteBuffer(materialsBuffer);
+                materialsBuffer = 0;
+            }
+            if (lightLevelsBuffer != 0)
+            {
+                gl.DeleteBuffer(lightLevelsBuffer);
+                lightLevelsBuffer = 0;
+            }
+            if (colorsBuffer != 0)
+            {
+                gl.DeleteBuffer(colorsBuffer);
+                colorsBuffer = 0;
+            }
+
+            // Clean up framebuffer and textures
+            DisposeFrameBuffer(gl);
+
+            // Dispose of other resources
+            voxelShader?.Dispose();
+            texShader?.Dispose();
+            screenQuad?.Dispose();
+            ssao?.Dispose();
+        });
+    }
 }

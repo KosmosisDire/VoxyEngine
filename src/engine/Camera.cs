@@ -48,6 +48,7 @@ public class Camera
         Frustum.CalculateFrustumPlanes(ViewProjectionMatrix);
     }
 
+
     public Camera(Vector3 position)
     {
         Position = position;

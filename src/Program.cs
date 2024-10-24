@@ -16,7 +16,7 @@ await window.Load();
 var mouse = window.context.Input.Mice[0];
 var keyboard = window.context.Input.Keyboards[0];
 mouse.Click += (m, b, v) => mouse.Cursor.CursorMode = CursorMode.Disabled;
-var camera = new FreeLookCamera(keyboard, mouse, new Vector3(0, 0, 3), new Vector3(0, 0, 0));
+var camera = new FreeLookCamera(keyboard, mouse, new Vector3(97, 89, -28), new Vector3(0, 0, 0));
 
 ImGuiController imgui = null;
 window.context.ExecuteCmd((dt, gl) =>
@@ -32,7 +32,7 @@ window.OnRender((dt) =>
 {
     if (imgui == null) return;
 
-    voxelRenderer.Draw();
+    voxelRenderer.Draw(dt);
     
     // show imgui fps
     ImGui.Text($"FPS: {window.FPS}");
