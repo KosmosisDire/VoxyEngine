@@ -4,67 +4,38 @@
 const float EPSILON = 0.001;
 const int MAX_STEPS = 256;
 const float MAX_DIST = 1000.0;
-const int SPLIT_SIZE = 4;
-const int CHUNK_SIZE = 16; // 16 voxels per chunk dimension
-const float CHUNK_SIZE_INV = 0.0625;
-const float SPLIT_SIZE_INV = 0.25;
+const int SPLIT_SIZE = 5;
+const int CHUNK_SIZE = SPLIT_SIZE * SPLIT_SIZE; // 16 voxels per chunk dimension
+const float CHUNK_SIZE_INV = 1.0 / CHUNK_SIZE;
+const float SPLIT_SIZE_INV = 1.0 / SPLIT_SIZE;
 const int GRID_SIZE = 128; // 16x16x16 grid of chunks
 const uint INVALID_INDEX = 4294967295u; 
 
 // one bitmask per chunk representing whether each outer block is subdivided
-layout(std430, binding = 2) buffer ChunkBitmasksLow {
-    uint chunkMasksLow[];
+layout(std430, binding = 0) buffer ChunkBitmasksLow {
+    uvec4 chunkMasksLow[]; // 125 bits for 125 blocks per chunk, extra bits are flags (undecided)
 };
-layout(std430, binding = 3) buffer ChunkBitmasksHigh {
-    uint chunkMasksHigh[];
-};
-layout(std430, binding = 4) buffer BlockIndices {
-    uint blockIndices[]; // the index in the VoxelData buffer of the first voxel in each bock
-};
-
 // 64 voxel bitmasks per chunk
-layout(std430, binding = 6) buffer VoxelBitmasksLow {
-    uint voxelMasksLow[];
+layout(std430, binding = 1) buffer VoxelBitmasksLow {
+    uvec4 voxelMasksLow[]; // 125 bits for 125 voxels per block, extra bits are flags (for non homogenous for example)
 };
-layout(std430, binding = 7) buffer VoxelBitmasksHigh {
-    uint voxelMasksHigh[];
-};
-
-layout(std430, binding = 8) buffer VoxelData {
-    uint voxelData[]; // sparse array of voxel block data. 64 uints per voxel block
-    // starting from left: 2 bytes for color (5 bits per channel + 1 bit for emmisive)
+layout(std430, binding = 2) buffer BlockData {
+    uint blockData[]; // 1 byte per block just a pointer to the material index
 };
 
-// Queue storage in SSBO
-layout(std430, binding = 9) buffer FreeBlockIndicesQueue
-{
-    uint freeBlockIndicesQueue[]; // queue of indices of 64-voxel blocks that are free (used to index VoxelData)
+// not used for now, leaving here until I implement voxel data
+layout(std430, binding = 3) buffer VoxelData {
+    uint voxelData[]; // 1 byte per voxel for nonhomogenous blocks
 };
 
-// Atomic counters for queue pointers
-uniform uint blockIdxCapacity;
-layout(binding = 0) uniform atomic_uint tailPtr;
-layout(binding = 0) uniform atomic_uint headPtr;
-
-uint dequeueBlockIndex()
-{
-    if (atomicCounter(headPtr) == atomicCounter(tailPtr)) {
-        return INVALID_INDEX;
-    }
-    
-    uint localTail = atomicCounterIncrement(tailPtr) % (blockIdxCapacity);
-
-    uint index = freeBlockIndicesQueue[localTail];
-    freeBlockIndicesQueue[localTail] = INVALID_INDEX;
-
-    return index;
-}
-
-void enqueueBlockIndex(uint index)
-{
-    uint localHead = atomicCounterIncrement(headPtr) % (blockIdxCapacity);
-    freeBlockIndicesQueue[localHead] = index;
-}
+// materials 256 total
+struct Material {
+    vec3 color;
+    bool emissive;
+};
+layout(std430, binding = 4) buffer Materials {
+    Material materials[];
+};
 
 // Utility functions
 bool getBit(int index, uint maskLow, uint maskHigh) {
