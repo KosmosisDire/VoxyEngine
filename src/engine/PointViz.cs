@@ -2,6 +2,8 @@ using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
+using ShaderType = OpenTK.Graphics.OpenGL.ShaderType;
+
 namespace Engine;
 
 public class PointCloudVisualizer : GameWindow
@@ -69,8 +71,8 @@ public class PointCloudVisualizer : GameWindow
         ";
 
         // Compile and link shaders
-        int vertexShader = CompileShader(ShaderType.VertexShader, vertexShaderSource);
-        int fragmentShader = CompileShader(ShaderType.FragmentShader, fragmentShaderSource);
+        int vertexShader = CompileShader(OpenTK.Graphics.OpenGL4.ShaderType.VertexShader, vertexShaderSource);
+        int fragmentShader = CompileShader(OpenTK.Graphics.OpenGL4.ShaderType.FragmentShader, fragmentShaderSource);
         shaderProgram = GL.CreateProgram();
         GL.AttachShader(shaderProgram, vertexShader);
         GL.AttachShader(shaderProgram, fragmentShader);
@@ -139,7 +141,7 @@ public class PointCloudVisualizer : GameWindow
         SwapBuffers();
     }
 
-    private int CompileShader(ShaderType type, string source)
+    private int CompileShader(OpenTK.Graphics.OpenGL4.ShaderType type, string source)
     {
         int shader = GL.CreateShader(type);
         GL.ShaderSource(shader, source);

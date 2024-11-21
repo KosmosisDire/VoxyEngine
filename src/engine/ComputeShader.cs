@@ -4,43 +4,21 @@ using Silk.NET.OpenGL;
 
 namespace Engine;
 
-public class Shader : IDisposable
+public class ComputeShader : IDisposable
 {
-    public static Shader CurrentShader { get; private set; }
-    public static Shader DefaultShader { get; private set; }
-
-    private List<ShaderLoader> shaders = [];
-    public uint handle { get; private set; }
-
+    private uint handle;
+    private readonly GLContext ctx;
     private Dictionary<string, object> uniforms = new();
-    private GLContext ctx;
 
-    public Shader(GLContext ctx, string vertexShaderPath, string fragmentShaderPath)
+    public ComputeShader(GLContext ctx, string computeShaderPath)
     {
         this.ctx = ctx;
 
-        ctx.ExecuteCmd((dt, gl) => 
+        ctx.ExecuteCmd((dt, gl) =>
         {
             handle = gl.CreateProgram();
-            AttachShader(new ShaderLoader(ctx, vertexShaderPath, ShaderType.Vertex));
-            AttachShader(new ShaderLoader(ctx, fragmentShaderPath, ShaderType.Fragment));
-            Link();
-        });
-    }
-
-    private void AttachShader(ShaderLoader shader)
-    {
-        ctx.ExecuteCmd((dt, gl) => 
-        {
-            shaders.Add(shader);
-            gl.AttachShader(handle, shader.handle);
-        });
-    }
-
-    private void Link()
-    {
-        ctx.ExecuteCmd((dt, gl) => 
-        {
+            var loader = new ShaderLoader(gl, computeShaderPath, ShaderType.Compute);
+            gl.AttachShader(handle, loader.handle);
             gl.LinkProgram(handle);
 
             // Check for linking errors
@@ -48,25 +26,38 @@ public class Shader : IDisposable
             if (status == 0)
             {
                 string infoLog = gl.GetProgramInfoLog(handle);
-                throw new Exception($"Error linking program: {infoLog}");
+                throw new Exception($"Error linking compute shader: {infoLog}");
             }
+
+            // Clean up shader after linking
+            gl.DetachShader(handle, loader.handle);
+            loader.Dispose();
+
+            // Enable debug output
+            gl.Enable(EnableCap.DebugOutput);
+            gl.Enable(EnableCap.DebugOutputSynchronous);
         });
     }
-
-    public void Use()
+ 
+    public void Dispatch(uint groupsX, uint groupsY = 1, uint groupsZ = 1)
     {
-        ctx.RenderCmd((dt, gl) => 
+        if (groupsX == 0 || groupsY == 0 || groupsZ == 0)
+        {
+            throw new ArgumentException("Dispatch group size cannot be zero");
+        }
+        
+        ctx.ExecuteCmd((dt, gl) =>
         {
             gl.UseProgram(handle);
 
-            if (CurrentShader == this) return;
-            
+            // Set any pending uniforms
             foreach (var uniform in uniforms)
             {
                 SetUniform(uniform.Key, uniform.Value);
             }
 
-            CurrentShader = this;
+            gl.DispatchCompute(groupsX, groupsY, groupsZ);
+            gl.MemoryBarrier(MemoryBarrierMask.ShaderStorageBarrierBit);
         });
     }
 
@@ -78,6 +69,18 @@ public class Shader : IDisposable
             if (value is int i)
             {
                 gl.Uniform1(location, i);
+            }
+            else if (value is uint u)
+            {
+                gl.Uniform1(location, u);
+            }
+            else if (value is long l)
+            {
+                gl.Uniform1(location, l);
+            }
+            else if (value is ulong ul)
+            {
+                gl.Uniform1(location, ul);
             }
             else if (value is float f)
             {
@@ -154,16 +157,11 @@ public class Shader : IDisposable
         });
     }
 
+
     public void Dispose()
     {
         ctx.ExecuteCmd((dt, gl) =>
         {
-            foreach (var shader in shaders)
-            {
-                gl.DetachShader(handle, shader.handle);
-                shader.Dispose();
-            }
-
             gl.DeleteProgram(handle);
             GC.SuppressFinalize(this);
         });

@@ -16,7 +16,8 @@ await window.Load();
 var mouse = window.context.Input.Mice[0];
 var keyboard = window.context.Input.Keyboards[0];
 mouse.Click += (m, b, v) => mouse.Cursor.CursorMode = CursorMode.Disabled;
-var camera = new FreeLookCamera(keyboard, mouse, new Vector3(97, 89, -28), new Vector3(0, 0, 0));
+var camera = new FreeLookCamera(keyboard, mouse, new Vector3(1, 0.2f, 1) * (ChunkManager2.chunkGridWidth + 1), new Vector3(0, 0, 0));
+camera.speed = 10;
 
 ImGuiController imgui = null;
 window.context.ExecuteCmd((dt, gl) =>
@@ -25,8 +26,7 @@ window.context.ExecuteCmd((dt, gl) =>
 });
 
 
-var voxelRenderer = new VoxelRenderer(window, camera, 256);
-voxelRenderer.UpdateTerrain(Vector3.Zero);
+var voxelRenderer = new VoxelRenderer2(window, camera);
 
 window.OnRender((dt) =>
 {
@@ -35,7 +35,9 @@ window.OnRender((dt) =>
     voxelRenderer.Draw(dt);
     
     // show imgui fps
-    ImGui.Text($"FPS: {window.FPS}");
+    ImGui.Text($"Frame Time: {((1/window.FPS) * 1000)}ms");
+    // show camera position
+    ImGui.Text($"Camera Position: {camera.Position}");
     imgui.Render();
 });
 
@@ -44,12 +46,6 @@ window.OnUpdate((dt) =>
     if (imgui == null) return;
 
     imgui.Update((float)dt);
-    camera.AspectRatio = window.Size.X / window.Size.Y;
+    camera.AspectRatio = (float)window.Size.X / window.Size.Y;
     camera.Update(dt);
 });
-
-// using System.Numerics;
-// var tree = new OctreeGenerator();
-// var positions = tree.GenerateOctree(32, Vector3.Zero).Where(n => n.PosAndSize.W == 8).Select(n => new Vector3(n.PosAndSize.X, n.PosAndSize.Y, n.PosAndSize.Z)).ToList();
-
-// new PointCloudVisualizer(positions, 3).Run();

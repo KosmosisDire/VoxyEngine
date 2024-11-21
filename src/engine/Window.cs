@@ -43,8 +43,9 @@ public class Window
         }
 
         WindowOptions options = WindowOptions.Default;
-        options.Size = new Vector2D<int>(1080, 1080);
+        options.Size = new Vector2D<int>(1920, 1080);
         options.Title = "1.2 - Drawing a Quad";
+        options.VSync = false;
 
         window = SilkWindowObj.Create(options);
         context = new GLContext(window);
