@@ -1,432 +1,333 @@
 #version 460
 
 #include "common.glsl"
+#include "lygia/generative/snoise.glsl"
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
 layout(rgba32f, binding = 0) uniform image2D outputImage;
 
+// Uniforms
 uniform mat4 viewMatrix;
 uniform mat4 projMatrix;
 uniform vec3 cameraPos;
 uniform vec3 sunDir;
 uniform vec3 sunColor;
+uniform float time;
 
-struct DDAState {
+// Enhanced result struct for raymarch hits
+struct RaymarchResult {
+    bool hit;
+    vec3 position;
+    vec3 normal;
     ivec3 cell;
-    ivec3 raySign;
-    vec3 deltaDist;
-    vec3 sideDist;
+    uint materialId;
+    float distance;
+    bool isHomogeneous;
+    int blockIndex;
+    int voxelIndex;
 };
 
-struct StepCounts {
-    int chunkSteps;
-    int outerSteps;
-    int voxelSteps;
-    int totalSteps;
-    int reinitializations;
-};
- 
-DDAState initDDA(vec3 pos, vec3 rayDir, vec3 invDir) {
-    DDAState state;
+// Calculate ray direction from pixel coordinates
+vec3 getRayDir(ivec2 pixel, ivec2 screenSize) {
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(screenSize);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 clipPos = vec4(ndc, 1.0, 1.0);
+    vec4 viewPos = inverse(projMatrix) * clipPos;
+    viewPos.w = 0.0;
+    vec3 worldDir = (inverse(viewMatrix) * viewPos).xyz;
+    return normalize(worldDir);
+}
+
+// Sky color calculation
+vec3 getSkyColor(vec3 dir) {
+    float sunDot = max(0.0, dot(dir, sunDir));
+    vec3 sun = (pow(sunDot, 48.0) + pow(sunDot, 4.0) * 0.2) * sunColor;
     
-    state.raySign = ivec3(sign(rayDir));
-    state.cell = ivec3(floor(pos));
-    state.deltaDist = invDir;
-    state.sideDist = ((state.cell - pos) + 0.5 + state.raySign * 0.5) * state.deltaDist;
-
-    return state;
+    float sunHeight = dot(vec3(0,1,0), sunDir);
+    vec3 skyColor = mix(
+        mix(sunColor, vec3(0.6, 0.7, 0.9), sunHeight),
+        vec3(0.2, 0.3, 0.7),
+        dir.y
+    );
+    
+    return sun + skyColor;
 }
 
-vec3 stepMask(vec3 sideDist) {
-    // Yoinked from https://www.shadertoy.com/view/l33XWf
-    bvec3 move;
-    bvec3 pon=lessThan(sideDist.xyz,sideDist.yzx);
+// Simple single-level DDA raymarching for shadows/AO
+RaymarchResult raymarchSingle(vec3 origin, vec3 direction, int maxSteps) {
+    vec3 invDir = 1.0 / max(abs(direction), vec3(EPSILON));
+    invDir *= sign(direction);
 
-    move.x=pon.x && !pon.z;
-    move.y=pon.y && !pon.x;
-    move.z=!(move.x||move.y);
-
-    return vec3(move);
-}
-
-ivec3 stepDDA(inout DDAState state)
-{
-    ivec3 mask = ivec3(stepMask(state.sideDist));
-    ivec3 normalNeg = mask * state.raySign;
-    state.cell += normalNeg;
-    state.sideDist += mask * state.raySign * state.deltaDist;
-    return -normalNeg;
-}
-
-void stepDDANoNormal(inout DDAState state)
-{
-    ivec3 mask = ivec3(stepMask(state.sideDist));
-    ivec3 normalNeg = mask * state.raySign;
-    state.cell += normalNeg;
-    state.sideDist += mask * state.raySign * state.deltaDist;
-}
-
-bool isInBounds(ivec3 cell, ivec3 boundsMax) {
-    return all(greaterThanEqual(cell, ivec3(0))) && all(lessThan(cell, boundsMax));
-}
-
-vec3 getDDAUVs(DDAState state, vec3 rayPos, vec3 rayDir)
-{
-    vec3 mini = ((vec3(state.cell)-rayPos) + 0.5 - 0.5 * vec3(state.raySign)) * state.deltaDist;
-    float d = max (mini.x, max (mini.y, mini.z));
-    vec3 intersect = rayPos + rayDir * d;
-    vec3 uv3d = intersect - vec3(state.cell);
-
-    if (state.cell == floor(rayPos)) // Handle edge case where camera origin is inside of block
-        uv3d = rayPos - state.cell;
-
-    return uv3d;
-}
-
-uint raymarchMultilevel(vec3 rayPos, vec3 rayDir, int maxSteps, out StepCounts steps, out ivec3 normal, out vec3 hitPos)
-{
-    // simple single level dda traversal
-    steps.chunkSteps = 0;
-    steps.outerSteps = 0;
-    steps.voxelSteps = 0;
-    steps.totalSteps = 0;
-    steps.reinitializations = 0;
-
-    vec3 invDir = 1.0 / rayDir;
-
-    // intersect with the chunk grid
     float tMin, tMax;
-    if (intersectBox(rayPos, invDir, vec3(0), vec3(GRID_SIZE), tMin, tMax))
-    {
-        rayPos += max(tMin - EPSILON, 0.0) * rayDir;
+    if (!intersectBox(origin, invDir, vec3(0), vec3(GRID_SIZE, GRID_SIZE, GRID_SIZE), tMin, tMax)) {
+        return RaymarchResult(false, vec3(0), vec3(0), ivec3(0), 0, 0, false, -1, -1);
     }
 
-    DDAState chunkDDA = initDDA(rayPos, rayDir, invDir);
-    steps.reinitializations++;
-    while (steps.totalSteps < maxSteps)
-    {
-        bool insideGrid = all(lessThanEqual(chunkDDA.cell, ivec3(GRID_SIZE - EPSILON))) && all(greaterThanEqual(chunkDDA.cell, ivec3(EPSILON)));
+    if (tMin > 0) {
+        origin += (tMin + EPSILON) * direction;
+    }
 
-        uint chunkIndex = getChunkIndex(chunkDDA.cell);
-        uint chunkMaskLow = chunkMasksLow[chunkIndex];
-        uint chunkMaskHigh = chunkMasksHigh[chunkIndex];
+    int steps = 0;
+    ivec3 normal;
 
-        if (insideGrid && (chunkMaskLow != 0 || chunkMaskHigh != 0))
-        {
-            uint chunkOffset = chunkIndex * SPLIT_SIZE * SPLIT_SIZE * SPLIT_SIZE;
+    vec3 voxelEnter = origin * CHUNK_SIZE;
+    DDAState voxelDDA = initDDA(voxelEnter, direction, invDir);
 
-            vec3 chunkUVs = getDDAUVs(chunkDDA, rayPos, rayDir);
-            vec3 blockEnter = clamp(chunkUVs * SPLIT_SIZE, vec3(EPSILON), vec3(SPLIT_SIZE - EPSILON));
-            DDAState blockDDA = initDDA(blockEnter, rayDir, invDir);
-            steps.reinitializations++;
-            while (steps.totalSteps < maxSteps && all(lessThanEqual(blockDDA.cell, ivec3(SPLIT_SIZE - EPSILON))) && all(greaterThanEqual(blockDDA.cell, ivec3(EPSILON))))
-            {
-                int blockIndexLocal = getSplitIndexLocal(blockDDA.cell);
+    while (steps < maxSteps && isInBounds(voxelDDA.cell, ivec3(GRID_SIZE * CHUNK_SIZE))) {
+        int chunkIndex = getChunkIndex(ivec3(voxelDDA.cell / (BLOCK_SIZE * BLOCK_SIZE)));
+        int blockLocalIndex = getLocalIndex(ivec3((voxelDDA.cell / BLOCK_SIZE) % BLOCK_SIZE));
+        
+        uvec4 chunkMask = chunkMasks[chunkIndex];
+        if (!isEmptyMask(chunkMask) && getBit(chunkMask, blockLocalIndex)) {
+            int blockIndex = globalIndex(chunkIndex, blockLocalIndex);
+            int voxelLocalIndex = getLocalIndex(voxelDDA.cell % BLOCK_SIZE);
+            
+            if (getBit(blockMasks[blockIndex], voxelLocalIndex)) {
+                vec3 hitPos = vec3(voxelDDA.cell) / float(CHUNK_SIZE);
+                uint materialId = getBlockMaterialIndex(blockIndex);
+                
+                return RaymarchResult(
+                    true, hitPos, vec3(normal), voxelDDA.cell,
+                    materialId, distance(origin, hitPos),
+                    false,
+                    blockIndex, voxelLocalIndex
+                );
+            }
+        }
 
-                if (getBit(blockIndexLocal, chunkMaskLow, chunkMaskHigh))
+        normal = stepDDA(voxelDDA);
+        steps++;
+    }
+
+    return RaymarchResult(false, vec3(0), vec3(0), ivec3(0), 0, 0, false, -1, -1);
+}
+
+// Multi-level raymarching with hierarchical material handling
+RaymarchResult raymarchMultiLevel(vec3 origin, vec3 direction, int maxSteps) {
+    vec3 invDir = 1.0 / max(abs(direction), vec3(EPSILON));
+    invDir *= sign(direction);
+
+    float tMin, tMax;
+    if (!intersectBox(origin, invDir, vec3(0), vec3(GRID_SIZE, GRID_SIZE, GRID_SIZE), tMin, tMax)) {
+        return RaymarchResult(false, vec3(0), vec3(0), ivec3(0), 0, 0, false, -1, -1);
+    }
+
+    if (tMin > 0) {
+        origin += (tMin + EPSILON) * direction;
+    }
+
+    int steps = 0;
+    ivec3 normal;
+
+    // Start at chunk level
+    DDAState chunkDDA = initDDA(origin, direction, invDir);
+    while (steps < maxSteps && isInBounds(chunkDDA.cell, ivec3(GRID_SIZE))) {
+        int chunkIndex = getChunkIndex(chunkDDA.cell);
+        uvec4 chunkMask = chunkMasks[chunkIndex];
+
+        if (!isEmptyMask(chunkMask)) {
+            // Get entry point into chunk space
+            vec3 chunkUVs = getDDAUVs(chunkDDA, origin, direction);
+            vec3 blockOrigin = chunkUVs * float(BLOCK_SIZE);
+            blockOrigin = clamp(blockOrigin, vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
+            
+            // Initialize block DDA
+            DDAState blockDDA = initDDA(blockOrigin, direction, invDir);
+
+            while (steps < maxSteps && isInBounds(blockDDA.cell, ivec3(BLOCK_SIZE))) {
+                int blockLocalIndex = getLocalIndex(blockDDA.cell);
+
+                if (getBit(chunkMask, blockLocalIndex))
                 {
-                    uint blockIndex = chunkOffset + blockIndexLocal;
-                    uint blockMaskLow = voxelMasksLow[blockIndex];
-                    uint blockMaskHigh = voxelMasksHigh[blockIndex];
-                    uint blockDataStartIndex = blockIndices[blockIndex];
+                    int blockIndex = globalIndex(chunkIndex, blockLocalIndex);
+                    uvec4 blockMask = blockMasks[blockIndex];
 
-                    if (blockDataStartIndex != INVALID_INDEX)
-                    {
-                        // just return the first voxel for debugging
-                        // hitPos = (chunkDDA.cell * CHUNK_SIZE + blockDDA.cell * SPLIT_SIZE + vec3(EPSILON)) * CHUNK_SIZE_INV;
-                        // return blockDataStartIndex;
+                    if (!isEmptyMask(blockMask)) {
+                        // Cache homogeneous block material if possible
+                        uint materialId = getBlockMaterialIndex(blockIndex);
+                        bool isHomogeneous = isBlockHomogenous(blockIndex);
 
-                        vec3 blockUVs = getDDAUVs(blockDDA, blockEnter, rayDir);
-                        vec3 voxelEnter = clamp(blockUVs * SPLIT_SIZE, vec3(EPSILON), vec3(SPLIT_SIZE - EPSILON));
-                        DDAState voxelDDA = initDDA(voxelEnter, rayDir, invDir);
-                        steps.reinitializations++;
-                        int innerSteps = 0;
-                        while(innerSteps <= 12 && all(lessThanEqual(voxelDDA.cell, ivec3(SPLIT_SIZE - EPSILON))) && all(greaterThanEqual(voxelDDA.cell, ivec3(EPSILON))))
+                        // Get entry point into block space
+                        vec3 blockUVs = getDDAUVs(blockDDA, blockOrigin, direction);
+                        vec3 voxelOrigin = blockUVs * float(BLOCK_SIZE);
+                        voxelOrigin = clamp(voxelOrigin, vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
+                        
+                        // end traversal at higher level
+                        if (false)
                         {
-                            int voxelIndexLocal = getSplitIndexLocal(voxelDDA.cell);
-                            if (getBit(voxelIndexLocal, blockMaskLow, blockMaskHigh))
-                            {
-                                vec3 voxelUVs = getDDAUVs(voxelDDA, voxelEnter, rayDir);
-                                hitPos = (chunkDDA.cell * CHUNK_SIZE + blockDDA.cell * SPLIT_SIZE + voxelDDA.cell + voxelUVs) * CHUNK_SIZE_INV;
-                                return blockDataStartIndex + voxelIndexLocal;
+                            ivec3 absoluteCell = chunkDDA.cell * CHUNK_SIZE + blockDDA.cell * BLOCK_SIZE;
+                            vec3 hitPos = vec3(absoluteCell + voxelOrigin) / float(CHUNK_SIZE);
+                            return RaymarchResult(
+                                true,                    // hit
+                                hitPos,                  // position
+                                vec3(normal),            // normal
+                                absoluteCell,            // cell
+                                materialId,           // materialId
+                                distance(origin, hitPos),// distance
+                                isHomogeneous,           // isHomogeneous
+                                blockIndex,              // blockIndex
+                                0                        // voxelIndex
+                            );
+                        }
+                        
+                        // Initialize voxel DDA
+                        DDAState voxelDDA = initDDA(voxelOrigin, direction, invDir);
+
+                        while (steps < maxSteps && isInBounds(voxelDDA.cell, ivec3(BLOCK_SIZE))) {
+                            int voxelLocalIndex = getLocalIndex(voxelDDA.cell);
+
+                            if (getBit(blockMask, voxelLocalIndex)) {
+                                vec3 voxelUVs = getDDAUVs(voxelDDA, voxelOrigin, direction);
+                                ivec3 absoluteCell = chunkDDA.cell * CHUNK_SIZE + 
+                                                   blockDDA.cell * BLOCK_SIZE + 
+                                                   voxelDDA.cell;
+                                vec3 hitPos = vec3(absoluteCell + voxelUVs) / float(CHUNK_SIZE);
+
+                                if (!isHomogeneous && steps < maxSteps * 0.5)
+                                {
+                                    materialId = getVoxelMaterial(blockIndex, voxelLocalIndex);
+                                }
+
+                                return RaymarchResult(
+                                    true,                    // hit
+                                    hitPos,                  // position
+                                    vec3(normal),            // normal
+                                    absoluteCell,            // cell
+                                    materialId,           // materialId
+                                    distance(origin, hitPos),// distance
+                                    isHomogeneous,           // isHomogeneous
+                                    blockIndex,              // blockIndex
+                                    voxelLocalIndex          // voxelIndex
+                                );
                             }
-                            
+
                             normal = stepDDA(voxelDDA);
-                            steps.voxelSteps++;
-                            steps.totalSteps++;
-                            innerSteps++;
+                            steps++;
                         }
                     }
                 }
 
-                // Step the DDA
                 normal = stepDDA(blockDDA);
-                steps.outerSteps++;
-                steps.totalSteps++;
+                steps++;
             }
         }
 
-        // Step the DDA
         normal = stepDDA(chunkDDA);
-        steps.chunkSteps++;
-        steps.totalSteps++;
-    }
-
-    return INVALID_INDEX;
-}
-
-// Modify the single-level raymarch to use the new data structure
-uint raymarchSinglelevel(vec3 rayPos, vec3 rayDir, int maxSteps, out int steps)
-{
-    steps = 0;
-    vec3 invDir = 1.0 / rayDir;
-
-    vec3 voxelEnter = rayPos * SPLIT_SIZE * SPLIT_SIZE;
-    DDAState voxelDDA = initDDA(voxelEnter, rayDir, invDir);
-    while(steps < maxSteps && all(lessThanEqual(voxelDDA.cell, ivec3(GRID_SIZE * SPLIT_SIZE * SPLIT_SIZE - EPSILON))) && all(greaterThanEqual(voxelDDA.cell, ivec3(EPSILON))))
-    {
-        int chunkIndex = getChunkIndex(ivec3(voxelDDA.cell * CHUNK_SIZE_INV));
-        int blockLocalIndex = getSplitIndexLocal(ivec3((voxelDDA.cell / SPLIT_SIZE) % SPLIT_SIZE));
-        int blockIndexOffset = chunkIndex * SPLIT_SIZE * SPLIT_SIZE * SPLIT_SIZE + blockLocalIndex;
-
-        // Check if block exists
-        bool blockExists = getBit(blockLocalIndex, 
-                                chunkMasksLow[chunkIndex], 
-                                chunkMasksHigh[chunkIndex]);
-
-        if (blockExists) {
-            // Get physical block index and check voxel
-            uint physicalBlockIndex = blockIndices[blockIndexOffset];
-            uint voxelMaskLow = voxelMasksLow[blockIndexOffset];
-            uint voxelMaskHigh = voxelMasksHigh[blockIndexOffset];
-            int voxelLocalIndex = getSplitIndexLocal(voxelDDA.cell % SPLIT_SIZE);
-
-            if (getBit(voxelLocalIndex, voxelMaskLow, voxelMaskHigh) && 
-                all(lessThanEqual(voxelDDA.cell, ivec3(GRID_SIZE * SPLIT_SIZE * SPLIT_SIZE - EPSILON))) && 
-                all(greaterThanEqual(voxelDDA.cell, ivec3(EPSILON))))
-            {
-                return uint(physicalBlockIndex + voxelLocalIndex);
-            }
-        }
-        
-        stepDDANoNormal(voxelDDA);
         steps++;
     }
 
-    return INVALID_INDEX;
+    return RaymarchResult(false, vec3(0), vec3(0), ivec3(0), 0, 0, false, -1, -1);
 }
 
-// rayarch the scene at the block level before stepping down the voxel level only once for the first hit
-bool raymarchDoubleLevel(vec3 rayPos, vec3 rayDir, int maxSteps, out int steps)
-{
-    steps = 0;
-    vec3 invDir = 1.0 / rayDir;
-
-    vec3 blockEnter = rayPos * SPLIT_SIZE;
-    DDAState blockDDA = initDDA(blockEnter, rayDir, invDir);
-    while(steps < maxSteps && all(lessThanEqual(blockDDA.cell, ivec3(GRID_SIZE * SPLIT_SIZE - EPSILON))) && all(greaterThanEqual(blockDDA.cell, ivec3(EPSILON))))
-    {
-        int chunkIndex = getChunkIndex(ivec3(blockDDA.cell / SPLIT_SIZE));
-        int blockIndexLocal = getSplitIndexLocal(ivec3(blockDDA.cell % SPLIT_SIZE));
-
-        // Check if block exists
-        bool blockExists = getBit(blockIndexLocal, 
-                                chunkMasksLow[chunkIndex], 
-                                chunkMasksHigh[chunkIndex]);
-        
-        if (blockExists)
-        {
-            int chunkOffset = chunkIndex * SPLIT_SIZE * SPLIT_SIZE * SPLIT_SIZE;
-            int blockIndex = chunkOffset + blockIndexLocal;
-            uint blockMaskLow = voxelMasksLow[blockIndex];
-            uint blockMaskHigh = voxelMasksHigh[blockIndex];
-
-            if (blockMaskLow != 0 || blockMaskHigh != 0)
-            {
-                vec3 blockUVs = getDDAUVs(blockDDA, blockEnter, rayDir);
-                vec3 voxelEnter = clamp(blockUVs * SPLIT_SIZE, vec3(EPSILON), vec3(SPLIT_SIZE - EPSILON));
-                DDAState voxelDDA = initDDA(voxelEnter, rayDir, invDir);
-                int innerSteps = 0;
-                while(innerSteps <= 12 && all(lessThanEqual(voxelDDA.cell, ivec3(SPLIT_SIZE - EPSILON))) && all(greaterThanEqual(voxelDDA.cell, ivec3(EPSILON))))
-                {
-                    int voxelIndexLocal = getSplitIndexLocal(voxelDDA.cell);
-                    if (getBit(voxelIndexLocal, blockMaskLow, blockMaskHigh))
-                    {
-                        return true;
-                    }
-                    
-                    stepDDANoNormal(voxelDDA);
-                    innerSteps++;
-                }
-            }
-        }
-
-        stepDDANoNormal(blockDDA);
-        steps++;
+// Shadow ray check
+float castShadowRay(vec3 origin, vec3 normal) {
+    origin += normal * EPSILON;
+    RaymarchResult shadowResult = raymarchMultiLevel(origin, sunDir, 256);
+    
+    if (shadowResult.hit) {
+        return 0.0;
     }
-
-    return false;
+    
+    return 1.0;
 }
 
-vec3 calculateRayOrigin(ivec2 pixelCoord, ivec2 imageSize) {
-    vec3 origin = -vec3(viewMatrix[3]) * mat3(viewMatrix);
-    return origin;
-}
-
-vec3 calculateRayDirection(vec2 fragCoord) {
-    vec2 ndc = (fragCoord / vec2(imageSize(outputImage))) * 2.0 - 1.0;
-    vec4 clipSpacePos = vec4(ndc, 1.0, 1.0);
-    vec4 viewSpacePos = inverse(projMatrix) * clipSpacePos;
-    viewSpacePos.w = 0.0;
-    vec3 worldSpaceDir = (inverse(viewMatrix) * viewSpacePos).xyz;
-    return normalize(worldSpaceDir);
-}
-
-vec3 background(vec3 d)
-{
-    const float sun_intensity = 1.0;
-    vec3 sun = (pow(max(0.0, dot(d, sunDir)), 48.0) + pow(max(0.0, dot(d, sunDir)), 4.0) * 0.25) * sun_intensity * vec3(1.0, 0.85, 0.5);
-    // vec3 sky = mix(vec3(0.6, 0.65, 0.8), vec3(0.15, 0.25, 0.65), d.y) * 1.15;
-    float sunHeight = dot(vec3(0,1,0), sunDir);
-    vec3 sky = mix(mix(sunColor, vec3(0.6, 0.65, 0.8), sunHeight), vec3(0.15, 0.25, 0.65), d.y) * 1.15;
-    return sun + sky;
-}
-
-vec3 generateHemisphereSample(vec3 normal, int i, int n, inout uint seed) {
-    const float PHI = (1.0 + sqrt(5.0)) * 0.5;
+// Calculate ambient occlusion
+float calculateAO(vec3 position, vec3 normal, int sampleCount, vec2 pixelCoord) {
+    float ao = 0.0;
+    uint seed = uint(pixelCoord.x * 123745.0 + pixelCoord.y * 677890.0 + time * 111111.0);
     
-    // Base distribution with slight randomization
-    float i_n = (float(i) + randomFloat(seed) * 0.8) / float(n);
-    float phi = 2.0 * 3.14159265359 * (i_n * PHI);
-    
-    // Cosine weighted distribution for height
-    float cosTheta = sqrt(1.0 - i_n);
-    float sinTheta = sqrt(i_n);
-    
-    vec3 direction = vec3(
-        cos(phi) * sinTheta,
-        sin(phi) * sinTheta,
-        cosTheta
-    );
-    
-    // Create rotation basis
-    vec3 up = abs(normal.y) < 0.999 ? vec3(0, 1, 0) : vec3(1, 0, 0);
-    vec3 tangent = normalize(cross(up, normal));
-    vec3 bitangent = cross(normal, tangent);
-    
-    // Transform to world space
-    return normalize(
-        tangent * direction.x +
-        bitangent * direction.y +
-        normal * direction.z
-    );
-}
-
-float smoothFalloff(float dist) {
-    // Scale distance for desired AO radius
-    dist *= 0.5;
-    
-    // Smooth falloff curve
-    float near = exp(-dist * dist);
-    float far = 1.0 / (1.0 + dist * dist);
-    
-    return mix(near, far, smoothstep(0.0, 1.0, dist));
-}
-
-float calculateAO(vec3 hitPos, vec3 normal, ivec2 pixelCoord, ivec2 imageSize) {
-    float aoFactor = 0.0;
-    const int NUM_SAMPLES = 16;
-    int aoSteps;
-    
-    uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277) | 1u;
-    
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        vec3 aoDir = generateHemisphereSample(normal, i, NUM_SAMPLES, seed);
-        vec3 aoOrigin = hitPos + normal * EPSILON;
-
-        bool hit = raymarchSinglelevel(aoOrigin + aoDir * 0.1, aoDir, 10, aoSteps) != INVALID_INDEX;
+    for (int i = 0; i < sampleCount; i++) {
+        // Generate hemisphere sample
+        vec3 sampleDir = vec3(
+            randomFloat(seed) * 2.0 - 1.0,
+            randomFloat(seed) * 2.0 - 1.0,
+            randomFloat(seed) * 2.0 - 1.0
+        );
+        sampleDir = normalize(sampleDir * sign(dot(sampleDir, normal)));
         
-        if (hit) {
-            // Use actual distance for falloff calculation
-            float dist = float(aoSteps) * 0.00000001;
-            float occlusion = smoothFalloff(dist) * 2;
-            
-            // Weight based on angle between normal and sample direction
-            // float weight = max(dot(aoDir, normal), 0.0);
-            aoFactor += occlusion;
+        RaymarchResult aoResult = raymarchMultiLevel(position + normal * EPSILON, sampleDir, 6);
+        if (aoResult.hit) {
+            float dist = aoResult.distance;
+            ao += 1.0 / (1.0 + dist * dist * 0.1);
         }
     }
     
-    float ao = 1.0 - (aoFactor / float(NUM_SAMPLES));
-    return ao;
+    return 1.0 - (ao / float(sampleCount));
 }
 
-
-float directLight(vec3 origin, vec3 lightDir)
-{
-    StepCounts shadowSteps;
-    float light = 1.0;
-    vec3 shadowNormal;
-    vec3 shadowHitPos;
-    uint shadowIndex = raymarchMultilevel(origin, lightDir, 256, shadowSteps, shadowNormal, shadowHitPos);
-
-    if (shadowIndex != INVALID_INDEX)
-    {
-        light = 0.5;
+// Material shading function
+vec3 calculateShading(RaymarchResult hit) {
+    if (hit.materialId == EMPTY_VALUE) {
+        return vec3(1, 0, 0);
     }
 
-    return light;
+    Material material = materials[hit.materialId];
+    vec3 baseColor = material.color;
+
+    // if (hit.isHomogeneous)
+    // {
+    //     return vec3(0);
+    // }
+    // else
+    // {
+    //     return baseColor;
+    // }
+    
+    // Add material-specific noise if enabled
+    if (material.noiseStrength > 0.0) {
+        float noise = snoise(vec3(hit.cell) * material.noiseSize) * material.noiseStrength;
+        baseColor = clamp(baseColor + vec3(noise), 0.0, 1.0);
+    }
+    
+    // Calculate lighting components
+    float sun = max(0.0, dot(hit.normal, sunDir));
+
+    if (sun > 0) 
+    {
+        sun *= castShadowRay(hit.position, hit.normal);
+    }
+    
+    float ao = 0.4;//calculateAO(hit.position, hit.normal, 1, vec2(pixel));
+
+    // Ambient lighting
+    vec3 ambient = baseColor * 0.2 * ao;
+    
+    // Diffuse lighting
+    vec3 diffuse = baseColor * sunColor * sun;
+    
+    // Emissive
+    vec3 emissive = baseColor * material.emission;
+    
+    // Combine components
+    return ambient + diffuse + emissive;
 }
 
 void main() {
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 imageSize = imageSize(outputImage);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 screenSize = imageSize(outputImage);
     
-    if (any(greaterThanEqual(pixelCoord, imageSize)))
+    if (any(greaterThanEqual(pixel, screenSize))) {
         return;
-
-    vec3 origin = calculateRayOrigin(pixelCoord, imageSize); 
-    vec3 direction = calculateRayDirection(vec2(pixelCoord));
-
-    StepCounts steps;
-    ivec3 normal;
-    vec3 hitPos;
-
-    uint voxelIndex = raymarchMultilevel(origin, direction, MAX_STEPS, steps, normal, hitPos);
-    
-    if (voxelIndex != INVALID_INDEX)
-    {
-        float sqrDepth = dot(hitPos - cameraPos, hitPos - cameraPos);
-        vec3 voxelColor = unpackColor(voxelData[voxelIndex]);
-        float sun = max(0.0, dot(normal, sunDir));
-
-        // imageStore(outputImage, pixelCoord, vec4(vec3(sun), 1));
-
-        // Shadow calculation
-        if (sun > 0.0)
-        {
-            vec3 shadowOrigin = hitPos + normal * EPSILON;
-            vec3 shadowDir = sunDir;
-            sun *= directLight(shadowOrigin, shadowDir);
-        }
-        
-        // Ambient occlusion
-        float aoFactor = 1.0;
-        aoFactor = calculateAO(hitPos, normal, pixelCoord, imageSize);
-
-        // fog
-        float fog = 1.0 - exp(-sqrDepth * 0.00005);
-
-        vec3 ambient = voxelColor * 0.6 * aoFactor;
-        vec3 direct = voxelColor * sunColor * sun;
-        vec3 color = ambient + direct;
-
-        color = mix(color, background(direction), fog);
-        
-        imageStore(outputImage, pixelCoord, vec4(vec3(color), 1));
     }
-    else 
+    
+    // Calculate ray direction
+    vec3 rayDir = getRayDir(pixel, screenSize);
+    
+    // Perform primary ray march
+    RaymarchResult result = raymarchMultiLevel(cameraPos, rayDir, 512);
+    
+    if (result.hit)
     {
-        imageStore(outputImage, pixelCoord, vec4(background(direction), 1));
+        // Calculate final color
+        vec3 color = calculateShading(result);
+        
+        // Apply fog
+        float fogAmount = 1.0 - exp(-result.distance * 0.0005);
+        color = mix(color, getSkyColor(rayDir), fogAmount);
+        
+        imageStore(outputImage, pixel, vec4(color, 1.0));
+    } else {
+        // Sky color for missed rays
+        imageStore(outputImage, pixel, vec4(getSkyColor(rayDir), 1.0));
     }
 }

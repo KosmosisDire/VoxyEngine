@@ -3,89 +3,86 @@
 #include "common.glsl"
 #include "lygia/generative/snoise.glsl"
 
-layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(local_size_x = 5, local_size_y = 5, local_size_z = 5) in;
 
 // Uniforms for chunk generation
 uniform int chunkIndex;
 uniform int chunkCount;
 const float noiseScale = 0.03;
 
-bool genSolid(vec3 worldPos, int chunkIndex)
+bool genSolid(vec3 worldPos)
 {
-    // return true;
     // height map with 3 levels of noise
-    float h = snoise(vec2(worldPos.x, worldPos.z) * noiseScale);
+    float h = snoise(vec2(worldPos.x, worldPos.z) * noiseScale) * 2;
     h += snoise(vec2(worldPos.x, worldPos.z) * noiseScale * 2) * 0.5;
     h += snoise(vec2(worldPos.x, worldPos.z) * noiseScale * 4) * 0.25;
     h = h * 0.5 + 0.5;
-    h *= 7;
+    h *= 4;
     h += 30;
 
     // generate caves
-    float cave = snoise(worldPos * noiseScale * 10);
-    cave = pow(cave, 10.0);
-
+    float cave = snoise(worldPos * noiseScale);
     return worldPos.y < h && cave > 0;
 }
 
-// Generate a color based on position and fractal values
-void getSolidData(vec3 worldPos, out bool solid, out vec3 color, out bool emissive)
+uint getMaterialForPosition(vec3 worldPos, bool solidAbove) 
 {
-    solid = genSolid(worldPos, chunkIndex);
-    if (solid) {
-        emissive = false;
-        uint seedx = uint(worldPos.x);
-        uint seedy = uint(worldPos.y);
-        uint seedz = uint(worldPos.z);
-        color = vec3(randomFloat(seedx) * 0.5 + 0.5, randomFloat(seedy) * 0.5 + 0.5, randomFloat(seedz) * 0.5 + 0.5);
-        // bool solidAbove = genSolid(worldPos + vec3(0.0, 4 * noiseScale, 0.0), chunkIndex);
-        // bool solidAboveFar = genSolid(worldPos + vec3(0.0, 32 * noiseScale, 0.0), chunkIndex);
-        // if (!solidAbove && !solidAboveFar) {
-        //     color = vec3(0.31, 0.46, 0.39) + snoise(worldPos * 100) * 0.05;
-        //     emissive = false;
-        // }
-        // else if (!solidAbove) {
-        //     color = vec3(0.31, 0.27, 0.21) + snoise(worldPos * 50) * 0.05;
-        //     emissive = false;
-        // }
-        // else {
-        //     color = vec3(0.7, 0.7, 0.8) + snoise(worldPos * 3) * 0.04;
-        //     emissive = true;
-        // }
+    // Add some variation in materials based on depth and noise
+    float depth = 30.0 - worldPos.y;
+    float materialNoise = snoise(worldPos * noiseScale * 5);
+    
+    if (!solidAbove) {
+        // Surface material (grass)
+        return 1;
+    }
+    else if (depth < 5.0 || materialNoise > 0.7) {
+        // Near surface or random pockets (dirt)
+        return 2;
+    }
+    else if (materialNoise < -0.7) {
+        // Random ore deposits
+        return 4;
+    }
+    else {
+        // Default stone
+        return 3;
     }
 }
 
-
 void main()
 {
-    // Get our position in the outer grid
-    ivec3 outerPos = ivec3(gl_WorkGroupID) % SPLIT_SIZE;
+    // Get our position in the block grid
+    ivec3 blockPos = ivec3(gl_WorkGroupID) % BLOCK_SIZE;
     // Get our position in the voxel grid
-    ivec3 voxelPos = ivec3(gl_LocalInvocationID) % SPLIT_SIZE;
+    ivec3 voxelPos = ivec3(gl_LocalInvocationID) % BLOCK_SIZE;
 
-    for (int i = chunkIndex; i < chunkIndex + chunkCount; i++)
+    for (int chunk = chunkIndex; chunk < chunkIndex + chunkCount; chunk++)
     {
-        if (i >= GRID_SIZE * GRID_SIZE * GRID_SIZE) break;
+        if (chunk >= GRID_SIZE * GRID_SIZE * GRID_SIZE) break;
 
-        // Calculate world position more precisely
-        vec3 chunkOrigin = vec3(getChunkGridPos(i));
-        vec3 blockOffset = vec3(outerPos) / float(SPLIT_SIZE);
-        vec3 voxelOffset = vec3(voxelPos) / float(SPLIT_SIZE) / float(SPLIT_SIZE);
-        vec3 worldPos = chunkOrigin + blockOffset + voxelOffset;
+        ivec3 chunkPos = getChunkPos(chunk);
+        vec3 worldPos = composePosition(chunkPos, blockPos, voxelPos);
         
         // Generate terrain
-        bool solid;
-        vec3 color;
-        bool emissive;
-        getSolidData(worldPos, solid, color, emissive);
+        bool solid = genSolid(worldPos);
         
         if (solid)
         {
-            int blockIndex = getSplitIndexLocal(outerPos);
-            int voxelIndex = getSplitIndexLocal(voxelPos);
-            setVoxel(i, blockIndex, voxelIndex, color, emissive); // Normalize to voxel grid space
+            int blockLocalIndex = getLocalIndex(blockPos);
+            int voxelLocalIndex = getLocalIndex(voxelPos);
+            int blockIndex = globalIndex(chunk, blockLocalIndex);
+
+            // Set the occupancy bits
+            atomicSetChunkBit(chunk, blockLocalIndex);
+            atomicSetBlockBit(blockIndex, voxelLocalIndex);
+
+            // Check conditions for material selection
+            bool solidAbove = genSolid(worldPos + vec3(0, VOXEL_SIZE * 6, 0));
+            uint materialId = getMaterialForPosition(worldPos, solidAbove);
+
+            // Set the material using our new system
+            setVoxelMaterial(blockIndex, voxelLocalIndex, materialId);
+            memoryBarrier();
         }
     }
-    
-    
 }

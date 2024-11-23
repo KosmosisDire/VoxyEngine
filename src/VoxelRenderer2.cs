@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Numerics;
 using Engine;
 using Silk.NET.Maths;
@@ -14,14 +13,20 @@ public class VoxelRenderer2 : IDisposable
     
     private ComputeShader renderShader;
     private uint outputTexture;
-    private Vector3 sunDirection = new(0.7f, 0.5f, 0.5f);
-    private Vector3 sunColor = new(1f, 0.9f, 1f);
     private Vector2D<int> currentSize;
-
-    public long frameTime = 0;
-
-    Mesh screenQuad;
-    Shader blitShader;
+    
+    // Lighting parameters
+    private Vector3 sunDirection = new(0.7f, 0.5f, 0.5f);
+    private Vector3 sunColor = new(1f, 0.95f, 0.8f);
+    
+    // Screen quad for output
+    private Mesh screenQuad;
+    private Shader blitShader;
+    
+    // Generation parameters
+    private const int ChunksPerFrame = 1024; // Number of chunks to generate per frame
+    private bool isGenerating = true;
+    private ulong generatedChunks = 0;
 
     public unsafe VoxelRenderer2(Window window, Camera camera)
     {
@@ -31,29 +36,22 @@ public class VoxelRenderer2 : IDisposable
         this.chunkManager = new ChunkManager2();
         this.currentSize = window.Size;
 
+        // Create screen quad for output display
         screenQuad = MeshGen.Quad(ctx);
         screenQuad.CreateFlattenedBuffers();
         screenQuad.UploadBuffers();
 
-        // Create compute shader
+        // Initialize shaders
         renderShader = new ComputeShader(ctx, "shaders/raymarch.comp.glsl");
         blitShader = new Shader(ctx, "shaders/vert.glsl", "shaders/tex-frag.glsl");
         
         // Create initial output texture
         CreateOutputTexture();
 
-        // Initialize chunk manager buffers
+        // Initialize chunk manager
         chunkManager.CreateBuffers(ctx);
 
-        // for (int x = 0; x < 63; x++)
-        // for (int z = 0; z < 63; z++)
-        // for (int y = 0; y < 63; y++)
-        // {
-        //     var pos = new Vector3(x, y, z) * 16;
-        //     chunkManager.GenerateChunkTerrain(ctx, pos);
-        // }
-        
-        // Subscribe to window resize events
+        // Subscribe to window resize
         window.SilkWindow.Resize += HandleResize;
     }
 
@@ -64,14 +62,7 @@ public class VoxelRenderer2 : IDisposable
         currentSize = newSize;
         ctx.ExecuteCmd((dt, gl) =>
         {
-            // Delete old texture
-            if (outputTexture != 0)
-            {
-                gl.DeleteTexture(outputTexture);
-                outputTexture = 0;
-            }
-
-            // Create new texture with updated size
+            gl.DeleteTexture(outputTexture);
             CreateOutputTexture();
         });
     }
@@ -90,69 +81,65 @@ public class VoxelRenderer2 : IDisposable
             gl.BindImageTexture(0, outputTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.Rgba32f);
         });
     }
- 
-    ulong chunkIndex = 0;
-    int chunksPerFrame = 256;
 
     public void Draw(double dt)
     {
         ctx.RenderCmd((dt, gl) =>
         {
-            var timer = Stopwatch.StartNew();
-            timer.Start();
-
-            if (chunkIndex < ChunkManager2.numChunks / 2.0)
+            // Generate chunks if needed
+            if (isGenerating && generatedChunks < ChunkManager2.NumChunks)
             {
-                chunkManager.GenerateChunkTerrain(ctx, chunksPerFrame);
-                chunkIndex += (ulong)chunksPerFrame;
+                chunkManager.GenerateChunkTerrain(ctx, ChunksPerFrame);
+                generatedChunks += (ulong)ChunksPerFrame;
+                
+                if (generatedChunks >= ChunkManager2.NumChunks)
+                {
+                    isGenerating = false;
+                }
             }
-            
 
+            // Bind buffers and output texture
             chunkManager.BindBuffers(gl);
-
-            // Bind output texture
             gl.BindImageTexture(0, outputTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.Rgba32f);
 
-            // Set uniforms
+            // Update sun direction
+            sunDirection = Vector3.Transform(sunDirection, Matrix4x4.CreateRotationY(0.0001f));
+
+            // Set raymarching uniforms
             renderShader.SetUniform("viewMatrix", camera.ViewMatrix);
             renderShader.SetUniform("projMatrix", camera.PerspectiveMatrix);
             renderShader.SetUniform("cameraPos", camera.Position);
-            renderShader.SetUniform("worldOrigin", chunkManager.Origin);
             renderShader.SetUniform("sunDir", sunDirection);
             renderShader.SetUniform("sunColor", sunColor);
-            renderShader.SetUniform("blockIdxCapacity", ChunkManager2.maxBlockCount);
-
-
-            sunDirection = Vector3.Transform(sunDirection, Matrix4x4.CreateRotationY(0.0001f));
+            renderShader.SetUniform("time", (float)window.SilkWindow.Time);
 
             // Dispatch compute shader
-            uint groupSize = 8;
-            uint workGroupsX = (uint)((currentSize.X + (groupSize-1)) / groupSize);
-            uint workGroupsY = (uint)((currentSize.Y + (groupSize-1)) / groupSize);
+            uint groupSizeX = 4;
+            uint groupSizeY = 4;
+            uint workGroupsX = (uint)((currentSize.X + (groupSizeX - 1)) / groupSizeX);
+            uint workGroupsY = (uint)((currentSize.Y + (groupSizeY - 1)) / groupSizeY);
             renderShader.Dispatch(workGroupsX, workGroupsY, 1);
 
-            // Draw screen quad
+            // Draw result to screen
             gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
-
             blitShader.Use();
             gl.BindTexture(TextureTarget.Texture2D, outputTexture);
             blitShader.SetUniform("tex", 0);
             screenQuad.Draw();
-
-            frameTime = timer.ElapsedMilliseconds;
         });
     }
 
     public void Dispose()
     {
-        // Unsubscribe from window resize events
         window.SilkWindow.Resize -= HandleResize;
         
         ctx.ExecuteCmd((dt, gl) =>
         {
             renderShader?.Dispose();
+            blitShader?.Dispose();
             if (outputTexture != 0) gl.DeleteTexture(outputTexture);
             chunkManager.Dispose(gl);
+            screenQuad?.Dispose();
         });
     }
 }
