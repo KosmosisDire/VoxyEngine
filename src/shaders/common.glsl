@@ -1,34 +1,76 @@
 #version 460
 
+const float PI = 3.14159265359;
+
 // Core Constants
 const float EPSILON = 0.001;
 const int MAX_STEPS = 256;
 const float MAX_DIST = 1000.0;
 
 // Structure Constants
-const int BLOCK_SIZE = 5;            // 5x5x5 blocks per chunk
+const int BLOCK_SIZE = 8;      
 const int CHUNK_SIZE = BLOCK_SIZE * BLOCK_SIZE;
-const int GRID_SIZE = 128;           // 128x128x128 chunks
+const int GRID_SIZE = 25;          
 const float VOXEL_SIZE = 1.0 / CHUNK_SIZE;
 const uint INVALID_INDEX = 4294967295u;
 
+const uint BITS_PER_UINT = 32u;
+const uint BITS_PER_ARRAY = 128u;
+const uint UINTS_PER_MASK = 4u;
+
+const int NUM_DIRECTIONS = 26;
+const vec3 NORM_DIRECTIONS[26] = vec3[26](
+    // Must match C# MAIN_DIRECTIONS exactly
+    vec3(1, 0, 0), vec3(-1, 0, 0),
+    vec3(0, 1, 0), vec3(0, -1, 0),
+    vec3(0, 0, 1), vec3(0, 0, -1),
+    
+    normalize(vec3(1, 1, 0)), normalize(vec3(-1, 1, 0)),
+    normalize(vec3(1, -1, 0)), normalize(vec3(-1, -1, 0)),
+    normalize(vec3(1, 0, 1)), normalize(vec3(-1, 0, 1)),
+    normalize(vec3(1, 0, -1)), normalize(vec3(-1, 0, -1)),
+    normalize(vec3(0, 1, 1)), normalize(vec3(0, -1, 1)),
+    normalize(vec3(0, 1, -1)), normalize(vec3(0, -1, -1)),
+    
+    normalize(vec3(1, 1, 1)), normalize(vec3(-1, 1, 1)),
+    normalize(vec3(1, -1, 1)), normalize(vec3(-1, -1, 1)),
+    normalize(vec3(1, 1, -1)), normalize(vec3(-1, 1, -1)),
+    normalize(vec3(1, -1, -1)), normalize(vec3(-1, -1, -1))
+);
+
 // Material System
-struct Material {
-    vec3 color;
-    float metallic;
-    float roughness;
-    float emission;
+struct Material
+{
+    // gradient colors
+    vec4 colors[4];
+
     float noiseSize;
     float noiseStrength;
+    uint textureIds[2];
+    float textureBlend;
+
+    bool blendWithNoise;
+    bool isPowder;
+    bool isLiquid;
+    bool isCollidable;
+
+    float shininess;
+    float specularStrength;
+    float reflectivity;
+    float transparency;
+    float refractiveIndex;
+    float emission;
+
+    float p1;
 };
 
 // Buffer Bindings
 layout(std430, binding = 0) buffer ChunkMasks {
-    uvec4 chunkMasks[];    // 125 bits per chunk for block occupancy (5x5x5 blocks)
+    uvec4 chunkMasks[];    // 512 bits per chunk for block occupancy (4 uvec4s per block)
 };
 
 layout(std430, binding = 1) buffer BlockMasks {
-    uvec4 blockMasks[];    // 125 bits per block for voxel occupancy (5x5x5 voxels)
+    uvec4 blockMasks[];    // 512 bits per block for voxel occupancy (4 uvec4s per voxel)
 };
 
 layout(std430, binding = 2) buffer MaterialIndices {
@@ -39,7 +81,11 @@ layout(std430, binding = 3) buffer Materials {
     Material materials[];   // Array of material properties
 };
 
-// Convert 3D coordinates to local index for 5x5x5 structure
+layout(std430, binding = 4) buffer UncompressedMaterials {
+    uint uncompressedMaterials[];   // 4 materials per uint. One material index per voxel for use during voxel modifications before compression
+};
+
+// Convert 3D coordinates to local index
 int getLocalIndex(ivec3 pos) {
     return pos.x + pos.z * BLOCK_SIZE + pos.y * BLOCK_SIZE * BLOCK_SIZE;
 }
@@ -56,10 +102,7 @@ ivec3 getLocalPos(ivec3 pos) {
 
 // Get chunk position from chunk index
 ivec3 getChunkPos(int index) {
-    int x = index % GRID_SIZE;
-    int z = (index / GRID_SIZE) % GRID_SIZE;
-    int y = index / (GRID_SIZE * GRID_SIZE);
-    return ivec3(x, y, z);
+    return ivec3(index % GRID_SIZE, index / (GRID_SIZE * GRID_SIZE), (index / GRID_SIZE) % GRID_SIZE);
 }
 
 vec3 composePosition(ivec3 chunkPos, ivec3 blockPos, ivec3 voxelPos) {
@@ -76,27 +119,71 @@ int globalIndex(int parentIndex, int localIndex) {
     return parentIndex * BLOCK_SIZE * BLOCK_SIZE * BLOCK_SIZE + localIndex;
 }
 
-// Bit manipulation for uvec4 masks
-bool getBit(uvec4 mask, int index) {
-    int uintIndex = index / 32;
-    int bitIndex = index % 32;
-    return (mask[uintIndex] & (1u << bitIndex)) != 0u;
-}
-
 void atomicSetChunkBit(int chunkIndex, int blockIndex) {
-    int uintIndex = blockIndex / 32;
-    int bitIndex = blockIndex % 32;
-    atomicOr(chunkMasks[chunkIndex][uintIndex], 1u << bitIndex);
+    uint baseIndex = chunkIndex << 2u;  // chunkIndex * 4 (faster than multiplication)
+    uint arrayIndex = baseIndex + (blockIndex >> 7u); // blockIndex / 128
+    uint uintIndex = (blockIndex >> 5u) & 3u; // (blockIndex / 32) % 4
+    uint bitIndex = blockIndex & 31u; // blockIndex % 32
+    
+    // Pre-shift the bit to its final position
+    uint bitMask = 1u << bitIndex;
+    
+    // Single atomic operation
+    atomicOr(chunkMasks[arrayIndex][uintIndex], bitMask);
 }
 
 void atomicSetBlockBit(int blockIndex, int voxelIndex) {
-    int uintIndex = voxelIndex / 32;
-    int bitIndex = voxelIndex % 32;
-    atomicOr(blockMasks[blockIndex][uintIndex], 1u << bitIndex);
+    uint baseIndex = blockIndex << 2u;  // blockIndex * 4
+    uint arrayIndex = baseIndex + (voxelIndex >> 7u); // voxelIndex / 128
+    uint uintIndex = (voxelIndex >> 5u) & 3u; // (voxelIndex / 32) % 4
+    uint bitIndex = voxelIndex & 31u; // voxelIndex % 32
+    
+    // Pre-shift the bit to its final position
+    uint bitMask = 1u << bitIndex;
+    
+    atomicOr(blockMasks[arrayIndex][uintIndex], bitMask);
 }
 
-bool isEmptyMask(uvec4 mask) {
-    return mask.x == 0u && mask.y == 0u && mask.z == 0u && mask.w == 0u;
+struct Bitmask {
+    uvec4 mask1;
+    uvec4 mask2;
+    uvec4 mask3;
+    uvec4 mask4;
+};
+
+// Bit manipulation for masks
+bool getBit(Bitmask mask, int index) {
+    uvec4 selectedArray = 
+        (index < 128) ? mask.mask1 :
+        (index < 256) ? mask.mask2 :
+        (index < 384) ? mask.mask3 :
+                       mask.mask4;
+                       
+    return (selectedArray[(index >> 5) & 3] & (1u << (index & 31))) != 0u;
+}
+
+Bitmask getChunkBitmask(int chunkIndex) {
+    Bitmask mask;
+    int arrayIndex = chunkIndex * 4;
+    mask.mask1 = chunkMasks[arrayIndex];
+    mask.mask2 = chunkMasks[arrayIndex + 1];
+    mask.mask3 = chunkMasks[arrayIndex + 2];
+    mask.mask4 = chunkMasks[arrayIndex + 3];
+    return mask;
+}
+
+Bitmask getBlockBitmask(int blockIndex) {
+    Bitmask mask;
+    int arrayIndex = blockIndex * 4;
+    mask.mask1 = blockMasks[arrayIndex];
+    mask.mask2 = blockMasks[arrayIndex + 1];
+    mask.mask3 = blockMasks[arrayIndex + 2];
+    mask.mask4 = blockMasks[arrayIndex + 3];
+    return mask;
+}
+
+bool isEmptyMask(Bitmask mask) {
+    return mask.mask1 == uvec4(0u) && mask.mask2 == uvec4(0u) && mask.mask3 == uvec4(0u) && mask.mask4 == uvec4(0u);
 }
 
 // PCG Random number generator
@@ -113,17 +200,24 @@ float randomFloat(inout uint seed)
     return float(pcg(seed)) * (1.0 / 4294967296.0);
 }
 
+void setMaterial(int voxelIndex, uint materialIndex) {
+    uint uintIndex = voxelIndex / 4;  // Each uint stores 4 8-bit values
+    uint bitPosition = (voxelIndex % 4) * 8;  // Each material takes 8 bits
+    
+    // Clear the byte at the target position (8 bits)
+    uint clearMask = ~(0xFFu << bitPosition);
+    // Set the new material value
+    uint setMask = (materialIndex & 0xFFu) << bitPosition;
+    
+    atomicAnd(uncompressedMaterials[uintIndex], clearMask);
+    atomicOr(uncompressedMaterials[uintIndex], setMask);
+}
 
-
-
-
-
-
-
-
-
-
-
+uint getMaterial(int voxelIndex) {
+    uint uintIndex = voxelIndex / 4;
+    uint bitPosition = (voxelIndex % 4) * 8;
+    return (uncompressedMaterials[uintIndex] >> bitPosition) & 0xFFu;
+}
 
 // DDA
 
@@ -208,227 +302,111 @@ vec3 getDDAUVs(DDAState state, vec3 rayPos, vec3 rayDir) {
     return uvs;
 }
 
-
-
-
-
-
-
-
-
-
-
-// Hash map implementation for block to material index
-
-// Constants 
-const uint EMPTY_KEY = 0xFFFFFFFFu; // all table entries need to be initialized to this in C#
-const uint EMPTY_VALUE = 0xFFFFFFFFu;
-const uint TABLE_SIZE = 536870912; // Must be power of 2
-const uint TABLE_MASK = TABLE_SIZE - 1u;
-const uint maxProbes = 128u; // Prevent infinite loops
-
-struct KeyValue {
-    uint blockIndex;
-    uint matStartIdx; // will be divided by 4 to get array index and use mod to find the offset
-};
-
-layout(std430, binding = 4) buffer BlocksHashMap {
-    KeyValue blockToMatPtr[];
-};
-// voxel materials buffer
-layout(std430, binding = 5) buffer VoxelMaterials {
-    uint voxelMaterials[]; // 4 materials per uint
-};
-layout(std430, binding = 6) buffer VoxelMaterialsCounter {
-    uint voxelMaterialsCounter;
-};
-
-
-// MurmurHash3 implementation
-uint hash(uint k)
-{
-    k ^= k >> 16;
-    k *= 0x85ebca6bu;
-    k ^= k >> 13;
-    k *= 0xc2b2ae35u;
-    k ^= k >> 16;
-    return k & TABLE_MASK;
+float sampleOccupancy(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(CHUNK_SIZE * GRID_SIZE)))) {
+        return 0.0; // Outside grid is empty
+    }
+    
+    ivec3 chunkPos = pos / CHUNK_SIZE;
+    int chunkIndex = getChunkIndex(chunkPos);
+    Bitmask chunkMask = getChunkBitmask(chunkIndex);
+    
+    if (isEmptyMask(chunkMask)) {
+        return 0.0;
+    }
+    
+    ivec3 blockInChunk = (pos / BLOCK_SIZE) % BLOCK_SIZE;
+    int blockIndex = getLocalIndex(blockInChunk);
+    
+    if (!getBit(chunkMask, blockIndex)) {
+        return 0.0;
+    }
+    
+    int globalBlockIndex = globalIndex(chunkIndex, blockIndex);
+    Bitmask blockMask = getBlockBitmask(globalBlockIndex);
+    ivec3 voxelInBlock = pos % BLOCK_SIZE;
+    int voxelIndex = getLocalIndex(voxelInBlock);
+    
+    return getBit(blockMask, voxelIndex) ? 1.0 : 0.0;
 }
 
-// Returns true if insert successful
-bool insertBlockKey(uint blockIndex, out uint outMatStartIdx) {
-    uint slot = hash(blockIndex);
-    uint probeCount = 0u;
+vec3 getPerVoxelNormal(ivec3 cell, int voxelIndex, int blockIndex, Bitmask blockMask) {    
+    // For interior voxels, use fast path
+    ivec3 localPos = ivec3(
+        voxelIndex % BLOCK_SIZE,
+        voxelIndex / (BLOCK_SIZE * BLOCK_SIZE),
+        (voxelIndex / BLOCK_SIZE) % BLOCK_SIZE
+    );
     
-    while (probeCount < maxProbes) {
-        // Try atomic compare and swap on the blockIndex
-        uint prevKey = atomicCompSwap(blockToMatPtr[slot].blockIndex, EMPTY_KEY, blockIndex);
+    bool nearBoundary = any(lessThan(localPos, ivec3(1))) || 
+                       any(greaterThanEqual(localPos, ivec3(BLOCK_SIZE - 1)));
+                       
+    if (!nearBoundary) {
+        vec3 normal = vec3(0.0);
+        bool hasEmptyNeighbor = false;
         
-        if (prevKey == EMPTY_KEY) {
-            // We claimed the slot, so we increment the counter
-            uint newMatStartIdx = atomicAdd(voxelMaterialsCounter, 1);
-            // Set matStartIdx
-            atomicExchange(blockToMatPtr[slot].matStartIdx, newMatStartIdx);
-            outMatStartIdx = newMatStartIdx;
-            return true;
+        if (!getBit(blockMask, getLocalIndex(localPos + ivec3(1,0,0)))) {
+            normal.x += 1.0;
+            hasEmptyNeighbor = true;
         }
-        
-        if (prevKey == blockIndex) {
-            // Slot already exists, return its matStartIdx
-            outMatStartIdx = blockToMatPtr[slot].matStartIdx;
-            return true;
+        if (!getBit(blockMask, getLocalIndex(localPos + ivec3(-1,0,0)))) {
+            normal.x -= 1.0;
+            hasEmptyNeighbor = true;
+        }
+        if (!getBit(blockMask, getLocalIndex(localPos + ivec3(0,1,0)))) {
+            normal.y += 1.0;
+            hasEmptyNeighbor = true;
+        }
+        if (!getBit(blockMask, getLocalIndex(localPos + ivec3(0,-1,0)))) {
+            normal.y -= 1.0;
+            hasEmptyNeighbor = true;
+        }
+        if (!getBit(blockMask, getLocalIndex(localPos + ivec3(0,0,1)))) {
+            normal.z += 1.0;
+            hasEmptyNeighbor = true;
+        }
+        if (!getBit(blockMask, getLocalIndex(localPos + ivec3(0,0,-1)))) {
+            normal.z -= 1.0;
+            hasEmptyNeighbor = true;
         }
         
-        // Linear probe
-        slot = (slot + 1u) & TABLE_MASK;
-        probeCount++;
-    }
-    
-    return false; // Table full or too many collisions
-}
-
-uint lookupBlockKey(uint blockIndex) {
-    uint slot = hash(blockIndex);
-    uint probeCount = 0u;
-    
-    while (probeCount < maxProbes) {
-        uint k = blockToMatPtr[slot].blockIndex;
-        if (k == blockIndex) {
-            return blockToMatPtr[slot].matStartIdx;
+        if (hasEmptyNeighbor) {
+            return normalize(normal);
         }
-        if (k == EMPTY_KEY) {
-            return EMPTY_VALUE;
-        }
-        slot = (slot + 1u) & TABLE_MASK;
-        probeCount++;
+        
+        return vec3(0.0); // Return zero normal if no empty neighbors
     }
     
-    return EMPTY_VALUE;
-}
-
-void deleteBlockKey(uint blockIndex) {
-    uint slot = hash(blockIndex);
-    uint probeCount = 0u;
+    // For boundary voxels, use a separable gradient approximation
+    const float kernel[3] = float[3](-0.5, 0.0, 0.5);
+    const ivec3 offsets[3] = ivec3[3](ivec3(-1), ivec3(0), ivec3(1));
     
-    while (probeCount < maxProbes) {
-        if (blockToMatPtr[slot].blockIndex == blockIndex) {
-            // Mark as deleted by setting matStartIdx to empty
-            atomicExchange(blockToMatPtr[slot].matStartIdx, EMPTY_VALUE);
-            return;
-        }
-        if (blockToMatPtr[slot].blockIndex == EMPTY_KEY) {
-            return;
-        }
-        slot = (slot + 1u) & TABLE_MASK;
-        probeCount++;
-    }
-}
-
-
-// Material functions
-void atomicSetMaterialIndex(int blockIndex, uint materialIndex)
-{
-    int arrayPosition = blockIndex / 4;
-    int packedPosition = blockIndex % 4;
+    vec3 gradient = vec3(0.0);
     
-    // unset the bits
-    atomicAnd(materialIndices[arrayPosition], ~(0xFFu << (packedPosition * 8)));
-    // set the bits
-    atomicOr(materialIndices[arrayPosition], materialIndex << (packedPosition * 8));
-}
-
-bool isBlockHomogenous(int blockIndex)
-{
-    // check the 126th bit of the mask
-    return (atomicOr(blockMasks[blockIndex].w, 0) & 0x20000000u) != 0u;
-}
-
-bool isBlockInitialized(int blockIndex)
-{
-    // check the 127th bit of the mask
-    return (atomicOr(blockMasks[blockIndex].w, 0) & 0x40000000u) != 0u;
-}
-
-void setBlockHomogenous(int blockIndex)   
-{
-    atomicOr(blockMasks[blockIndex].w, 0x20000000u);
-}
-
-void setBlockInitialized(int blockIndex)
-{
-    atomicOr(blockMasks[blockIndex].w, 0x40000000u);
-}
-
-void clearBlockHomogenous(int blockIndex)
-{
-    atomicAnd(blockMasks[blockIndex].w, ~0x20000000u);
-}
-
-void clearBlockInitialized(int blockIndex)
-{
-    atomicAnd(blockMasks[blockIndex].w, ~0x40000000u);
-}
-
-uint getBlockMaterialIndex(int blockIndex)
-{
-    int arrayPosition = blockIndex / 4;
-    int packedPosition = blockIndex % 4;
-    return uint((atomicOr(materialIndices[arrayPosition], 0) >> (packedPosition * 8)) & 0xFFu);
-}
-
-void _setVoxelMaterial(int blockIndex, int voxelLocalIndex, uint materialIndex) {
-    // First try to get existing entry
-    uint matStartIdx;
-    insertBlockKey(blockIndex, matStartIdx);
-
-    // Now set the material index
-    uint arrayPosition = uint(matStartIdx * (125.0 / 4.0)) + voxelLocalIndex / 4;
-    uint packedPosition = voxelLocalIndex % 4;
-
-    atomicAnd(voxelMaterials[arrayPosition], ~ (0x000000FFu << (packedPosition * 8)));
-    atomicOr(voxelMaterials[arrayPosition], materialIndex << (packedPosition * 8));
-}
-
-void setVoxelMaterial(int blockIndex, int voxelLocalIndex, uint materialIndex)
-{
-    bool isInited = isBlockInitialized(blockIndex);
-
-    // if the material has not been set yet, set the homogenous bit
-    if (!isInited)
-    {
-        setBlockHomogenous(blockIndex);
-        setBlockInitialized(blockIndex);
-        atomicSetMaterialIndex(blockIndex, materialIndex);
+    // X gradient
+    float xSum = 0.0;
+    for (int i = 0; i < 3; i++) {
+        ivec3 samplePos = cell + ivec3(offsets[i].x, 0, 0);
+        xSum += kernel[i] * sampleOccupancy(samplePos);
     }
-
-    bool isHomogenous = isBlockHomogenous(blockIndex);
-    uint blockMaterial = getBlockMaterialIndex(blockIndex);
-
-    // if the material has been set already and is different, unset the homogenous bit
-    if (isInited && isHomogenous && blockMaterial != materialIndex)
-    {
-        clearBlockHomogenous(blockIndex);
-    }
-
-    isHomogenous = isBlockHomogenous(blockIndex);
+    gradient.x = xSum;
     
-    // if the block is not homogenous then we need to set the voxel data too
-    if(!isHomogenous)
-    {
-        // if the material is not homogenous, set the voxel material
-        _setVoxelMaterial(blockIndex, voxelLocalIndex, materialIndex);
+    // Y gradient
+    float ySum = 0.0;
+    for (int i = 0; i < 3; i++) {
+        ivec3 samplePos = cell + ivec3(0, offsets[i].y, 0);
+        ySum += kernel[i] * sampleOccupancy(samplePos);
     }
-} 
-
-uint getVoxelMaterial(int blockIndex, int voxelLocalIndex)
-{
-    uint matStartIdx = lookupBlockKey(blockIndex);
-    if (matStartIdx == EMPTY_VALUE)
-    {
-        return EMPTY_VALUE;
+    gradient.y = ySum;
+    
+    // Z gradient
+    float zSum = 0.0;
+    for (int i = 0; i < 3; i++) {
+        ivec3 samplePos = cell + ivec3(0, 0, offsets[i].z);
+        zSum += kernel[i] * sampleOccupancy(samplePos);
     }
-
-    uint arrayPosition = uint(matStartIdx * (125.0 / 4.0)) + voxelLocalIndex / 4;
-    uint packedPosition = voxelLocalIndex % 4;
-    return uint((voxelMaterials[arrayPosition] >> (packedPosition * 8)) & 0x000000FFu);
+    gradient.z = zSum;
+    
+    // Return zero normal if gradient is too small, otherwise return normalized negative gradient
+    return length(gradient) > EPSILON ? normalize(-gradient) : vec3(0.0);
 }

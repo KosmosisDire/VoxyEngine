@@ -5,7 +5,7 @@ using Silk.NET.Input;
 using Silk.NET.OpenGL.Extensions.ImGui;
 
 // Set working directory to find shaders
-Environment.CurrentDirectory = @"C:\Main Documents\Projects\Coding\C#\VoxelRaymarcher\src";
+Environment.CurrentDirectory = @"C:\Main\Projects\Coding\C#\VoxelRaymarcher\src";
 
 // Initialize window and input
 var window = new Window();
@@ -18,16 +18,15 @@ var keyboard = window.context.Input.Keyboards[0];
 // Lock cursor on click
 mouse.Click += (m, b, v) => mouse.Cursor.CursorMode = CursorMode.Disabled;
 
+
 // Initialize camera
 // Position camera based on world size for better initial view
-float worldSize = ChunkManager2.GridSize * ChunkManager2.ChunkSize;
-var camera = new FreeLookCamera(
+var player = new PlayerController(
     keyboard, 
     mouse,
-    new Vector3(1, 0.2f, 1) * (ChunkManager2.GridSize + 1),
+    new Vector3(1, 1, 1) * (ChunkManager.GridSize / 2),
     new Vector3(0, 0, 0)
 );
-camera.speed = worldSize * 0.03f; // Scale camera speed with world size
 
 // Initialize ImGui
 ImGuiController imgui = null;
@@ -37,20 +36,41 @@ window.context.ExecuteCmd((dt, gl) =>
 });
 
 // Create voxel renderer
-var voxelRenderer = new VoxelRenderer2(window, camera);
+var voxelRenderer = new VoxelRenderer(window, player.Camera);
+player.SetVoxelWorld(voxelRenderer);
+
+List<float> frameTimes = new List<float>();
+float averageDt = 16;
 
 // Render loop
 window.OnRender((dt) =>
 {
     if (imgui == null) return;
 
+    player.Update(dt);
     voxelRenderer.Draw(dt);
+
+    averageDt = averageDt * 0.95f + (float)dt * 0.05f;
     
-    // ImGui overlay
+    // ImGui overlay 
     ImGui.Begin("Debug Info", ImGuiWindowFlags.AlwaysAutoResize);
-    ImGui.Text($"FPS: {1.0/dt:F1}");
-    ImGui.Text($"Frame Time: {dt * 1000:F1}ms");
-    ImGui.Text($"Camera Position: {camera.Position}");
+    ImGui.Text($"Player Position: {player.Position}");
+    ImGui.Text($"Grounded: {player.IsGrounded}");
+    ImGui.Text($"Step Height: {player.currentStepHeight}");
+    ImGui.Text($"Hovered Material: {Materials.GetMaterialName(voxelRenderer.hoveredCastResult.materialId)}");
+    ImGui.Text($"Selected Material: {Materials.GetMaterialName(voxelRenderer.selectedMaterial)}");
+    ImGui.Text($"Place Size: {voxelRenderer.placeSize}");
+    ImGui.Separator();
+    ImGui.Text($"FPS: {1.0/averageDt:F1}");
+    ImGui.Text($"Frame Time: {averageDt * 1000:F1}ms");
+    frameTimes.Add((float)averageDt * 1000);
+    if (frameTimes.Count > 1000)
+    {
+        frameTimes.RemoveAt(0);
+    }
+    
+    var values = frameTimes.ToArray();
+    ImGui.PlotLines("Frame Times", ref values[0], frameTimes.Count, 0, "Frame Time (ms)");
     ImGui.End();
     
     imgui.Render();
@@ -62,12 +82,5 @@ window.OnUpdate((dt) =>
     if (imgui == null) return;
 
     imgui.Update((float)dt);
-    camera.AspectRatio = (float)window.Size.X / window.Size.Y;
-    camera.Update(dt);
-
-    // ESC to exit
-    if (keyboard.IsKeyPressed(Key.Escape))
-    {
-        window.SilkWindow.Close();
-    }
+    player.Camera.AspectRatio = (float)window.Size.X / window.Size.Y;
 });

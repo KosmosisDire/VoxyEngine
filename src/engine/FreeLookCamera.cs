@@ -8,11 +8,14 @@ public class FreeLookCamera : Camera
 {
     public float mouseSensitivity = 0.3f;
     public float speed = 50f;
-    private Vector2 lastMousePosition;
+    protected Vector2 lastMousePosition;
 
     public Vector3 yawPitchRoll;
-    private IKeyboard Keyboard;
-    private IMouse Mouse;
+    protected IKeyboard Keyboard;
+    protected IMouse Mouse;
+
+    public bool handleMove = true;
+    public bool handleLook = true;
 
     public FreeLookCamera(IKeyboard keyboard, IMouse mouse, Vector3 position, Vector3? yawPitchRoll = null) : base(position)
     {
@@ -23,25 +26,24 @@ public class FreeLookCamera : Camera
         Mouse = mouse;
     }
 
-    public void Update(double deltaTime)
+    public void HandleMove(double deltaTime)
     {
-        var forward = Forward;
-        var right = Right;
-        var up = Up;
-
         if (Keyboard.IsKeyPressed(Key.W))
-            Position += forward * (float)deltaTime * speed;
+                Position += Forward * (float)deltaTime * speed;
         if (Keyboard.IsKeyPressed(Key.S))
-            Position -= forward * (float)deltaTime * speed;
+            Position -= Forward * (float)deltaTime * speed;
         if (Keyboard.IsKeyPressed(Key.D))
-            Position += right * (float)deltaTime * speed;
+            Position += Right * (float)deltaTime * speed;
         if (Keyboard.IsKeyPressed(Key.A))
-            Position -= right * (float)deltaTime * speed;
+            Position -= Right * (float)deltaTime * speed;
         if (Keyboard.IsKeyPressed(Key.Space))
-            Position += up * (float)deltaTime * speed;
+            Position += Up * (float)deltaTime * speed;
         if (Keyboard.IsKeyPressed(Key.ShiftLeft))
-            Position -= up * (float)deltaTime * speed;
+            Position -= Up * (float)deltaTime * speed;
+    }
 
+    public void HandleLook(double deltaTime)
+    {
         if (lastMousePosition == Vector2.Zero)
             lastMousePosition = Mouse.Position;
 
@@ -52,5 +54,11 @@ public class FreeLookCamera : Camera
         Rotation = Quaternion.CreateFromYawPitchRoll(yawPitchRoll.X, yawPitchRoll.Y, yawPitchRoll.Z);
 
         lastMousePosition = Mouse.Position;
+    }
+
+    public virtual void Update(double deltaTime)
+    {
+        if (handleMove) HandleMove(deltaTime);        
+        if (handleLook) HandleLook(deltaTime);
     }
 }

@@ -1,227 +1,443 @@
 using System.Numerics;
 using Engine;
+using Silk.NET.Input;
+using Silk.NET.Maths;
 using Silk.NET.OpenGL;
-using Shader = Engine.Shader;
-
-namespace VoxelEngine;
+using MeshShader = Engine.MeshShader;
 
 public class VoxelRenderer : IDisposable
 {
-    // private ComputeShader directLightingShader;
-    // private ComputeShader blurShader;
-    // private ComputeShader sandPhysicsShader;
-    // private ComputeShader octreeOptimizeShader;
-    // private uint changesBuffer;
-    // private uint moveFlags;
-    // private uint currentFrame = 0;
+    private readonly GLContext ctx;
+    private readonly Window window;
+    private readonly Camera camera;
+    private readonly ChunkManager chunkManager;
 
-    private GLContext ctx;
-    private Window window;
-    private Camera camera;
+    private ComputeShader renderShader;
+    private ComputeShader sandSimShader;
+    private ComputeShader denoiseShader;
+    private ComputeShader compositeShader;
 
-    readonly Mesh screenQuad;
-    readonly Shader voxelShader;
+    // Split FBOs
+    private uint geometryFbo;
+    private uint postFbo;
 
-    Vector3 sunDirection = new Vector3(0.7f, 0.5f, 0.5f);
-    Vector3 sunColor = new Vector3(1, 0.9f, 1);
+    // Geometry pass textures
+    private uint colorTexture;
+    private uint normalTexture;
+    private uint depthTexture;
+    private uint aoTexture;
+    private uint materialTexture;
 
-    public unsafe VoxelRenderer(Window window, Camera camera, int chunkSize, float voxelSize)
+    // Post-process textures
+    private uint tempAoTexture;
+    private uint denoisedAoTexture;
+    private uint shadowTexture;
+    private uint compositedTexture;
+    private uint motionTexture;
+
+    private Vector2D<int> currentSize;
+
+    // Lighting parameters
+    private Vector3 sunDirection = new(0.7f, 0.5f, 0.5f);
+    private Vector3 sunColor = new(1f, 0.95f, 0.8f);
+
+    // Previous frame camera data for motion vectors
+    private Matrix4x4 prevViewProjectionMatrix;
+    private Vector3 prevCameraPosition;
+
+    // Sand simulation parameters
+    private uint currentFrame = 0;
+    private const uint PASSES = 27;
+
+    // Screen quad for output
+    private Mesh screenQuad;
+    private MeshShader blitShader;
+
+    // Generation parameters
+    private const int ChunksPerFrame = 128;
+    private bool isGenerating = true;
+    private ulong generatedChunks = 0;
+
+    public RaycastHit hoveredCastResult;
+    public RaycastSystem raycastSystem;
+    public VoxelEditorSystem voxelEditorSystem;
+
+    public unsafe VoxelRenderer(Window window, Camera camera)
     {
         this.ctx = window.context;
         this.window = window;
         this.camera = camera;
+        this.chunkManager = new ChunkManager();
+        this.currentSize = window.Size;
 
+        // Initialize previous frame data
+        this.prevViewProjectionMatrix = camera.ViewMatrix * camera.PerspectiveMatrix;
+        this.prevCameraPosition = camera.Position;
+
+        // Create screen quad for output display
         screenQuad = MeshGen.Quad(ctx);
         screenQuad.CreateFlattenedBuffers();
         screenQuad.UploadBuffers();
 
-        voxelShader = new Shader(window.context, "shaders/vert.glsl", "shaders/vox-frag2.glsl");
+        // Initialize shaders
+        renderShader = new ComputeShader(ctx, "shaders/raymarch.comp.glsl");
+        sandSimShader = new ComputeShader(ctx, "shaders/sand-sim.comp.glsl");
+        denoiseShader = new ComputeShader(ctx, "shaders/denoise.comp.glsl");
+        compositeShader = new ComputeShader(ctx, "shaders/composite.comp.glsl");
+        blitShader = new MeshShader(ctx, "shaders/vert.glsl", "shaders/tex-frag.glsl");
 
-        // ctx.ExecuteCmd((dt, gl) =>
-        // {
-        //     // Initialize compute shaders
-        //     directLightingShader = new ComputeShader(ctx, "shaders/lighting.comp.glsl");
-        //     blurShader = new ComputeShader(ctx, "shaders/lighting-blur.comp.glsl");
-        //     sandPhysicsShader = new ComputeShader(ctx, "shaders/falling.comp.glsl");
-        //     octreeOptimizeShader = new ComputeShader(ctx, "shaders/octree-optimize.comp.glsl");
+        raycastSystem = new RaycastSystem(ctx, chunkManager);
+        voxelEditorSystem = new VoxelEditorSystem(ctx, chunkManager);
 
+        // Create FBO and textures
+        CreateFramebufferResources();
 
-        //     // Initialize buffers
-        //     gl.GenBuffers(1, out changesBuffer);
-        //     gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, changesBuffer);
-        //     gl.BufferData(BufferTargetARB.ShaderStorageBuffer, sizeof(int), null, BufferUsageARB.DynamicCopy);
+        // Initialize chunk manager
+        chunkManager.CreateBuffers(ctx);
 
-        //     gl.GenBuffers(1, out moveFlags);
-        //     gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, moveFlags);
-        //     gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(chunkSize * chunkSize * chunkSize * sizeof(int)), null, BufferUsageARB.DynamicCopy);
-        // });
-
-        window.SilkWindow.Update += (dt) =>
-        {
-            sunDirection = Vector3.Transform(sunDirection, Matrix4x4.CreateRotationY(0.0001f));
-        };
+        // Subscribe to window resize
+        window.SilkWindow.Resize += HandleResize;
     }
 
-
-    // public async Task UpdateChunks()
-    // {
-    //     await chunkManager.GenerateChunkTerrain(camera.Position);
-    // }
-
-    // int currentLevel = 0;
-    // int currentChunk = 0;
-    // public unsafe void OptimizeOctrees()
-    // {
-    //     ctx.RenderCmd((dt, gl) =>
-    //     {
-    //         var depth = MathF.Log2(chunkManager.ChunkSize);
-    //         octreeOptimizeShader.SetUniform("maxDepth", depth);
-    //         octreeOptimizeShader.SetUniform("currentLevel", currentLevel);
-    //         octreeOptimizeShader.SetUniform("chunkIndex", currentChunk);
-    //         octreeOptimizeShader.SetUniform("chunkSize", chunkManager.ChunkSize);
-    //         octreeOptimizeShader.SetUniform("voxelSize", chunkManager.VoxelSize);
-
-    //         int startSearch = currentChunk;
-    //         do
-    //         {
-    //             currentChunk = (currentChunk + 1) % ChunkManager.MAX_CHUNKS;
-    //         }
-    //         while ((chunkManager.ChunksArray[currentChunk] == null || chunkManager.ChunksArray[currentChunk].State != Chunk.ChunkState.Clean) && currentChunk != startSearch);
-                
-
-    //         if (currentChunk == 0)
-    //             currentLevel = (currentLevel + 1) % (int)depth;
-
-    //         const uint GROUP_SIZE = 64;
-    //         uint numWorkGroups = (uint)(chunkManager.NodeCount / GROUP_SIZE); 
-    //         octreeOptimizeShader.Dispatch(numWorkGroups, 1, 1);
-    //     });
-    // }
-
-    // public unsafe void UpdatePhysics(double deltaTime, Vector3 gravity)
-    // {
-    //     foreach (var (chunk, posBuffer, matBuffer, lightBuffer, colorBuffer) in chunkManager.GetVisibleChunks())
-    //     {
-    //         ctx.ExecuteCmd((dt, gl) =>
-    //         {
-    //             // Clear move flags buffer
-    //             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, moveFlags);
-    //             gl.ClearBufferData(GLEnum.ShaderStorageBuffer, GLEnum.R8i, GLEnum.RedInteger, GLEnum.Int, null);
-
-    //             gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 1, matBuffer);
-    //             gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 2, lightBuffer);
-    //             gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 3, colorBuffer);
-    //             gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 4, moveFlags);
-    //         });
-
-    //         sandPhysicsShader.SetUniform("chunkSize", chunk.NodeCount);
-    //         sandPhysicsShader.SetUniform("deltaTime", (float)deltaTime);
-    //         sandPhysicsShader.SetUniform("frame", currentFrame++);
-    //         sandPhysicsShader.SetUniform("gravityDir", Vector3.Normalize(gravity));
-    //         sandPhysicsShader.SetUniform("currentChunkPosition", chunk.Position);
-
-    //         const int COMPUTE_GROUP_SIZE = 512;
-    //         uint numWorkGroups = (uint)(chunk.LeafCount + COMPUTE_GROUP_SIZE - 1) / COMPUTE_GROUP_SIZE;
-    //         sandPhysicsShader.Dispatch(numWorkGroups);
-    //     }
-    // }
-
-    // int lightingChunk;
-    // public void CalculateLighting()
-    // {
-    //     // Only calculate lighting for chunks that are actually loaded and visible
-    //     ctx.ExecuteCmd((dt, gl) =>
-    //     {
-    //         var chunkPos = chunkManager.GetChunkPosition(camera.Position);
-    //         if (!chunkManager.ChunksLookup.TryGetValue(chunkPos, out var chunk))
-    //             return;
-    //         var chunkIndex = chunk.ChunkIndex;
-
-    //         int[] chunks = [lightingChunk, chunkIndex];
-
-    //         foreach (var c in chunks)
-    //         {
-    //             // Direct lighting pass
-    //             directLightingShader.SetUniform("chunkSize", chunkManager.ChunkSize);
-    //             directLightingShader.SetUniform("voxelSize", chunkManager.VoxelSize);
-    //             directLightingShader.SetUniform("lightDirection", sunDirection);
-    //             directLightingShader.SetUniform("lightColor", new Vector4(sunColor, 1.0f));
-    //             directLightingShader.SetUniform("currentTime", (uint)DateTime.UtcNow.Ticks);
-    //             directLightingShader.SetUniform("cameraPosition", camera.Position);
-    //             directLightingShader.SetUniform("currentChunk", c);
-
-    //             // Calculate dispatch size based on chunk dimensions
-    //             const uint GROUP_SIZE = 8;
-    //             uint numGroups = (uint)Math.Ceiling(chunkManager.ChunkSize / (float)GROUP_SIZE);
-    //             directLightingShader.Dispatch(numGroups, numGroups, numGroups);
-
-    //             // Memory barrier between lighting and blur passes
-    //             gl.MemoryBarrier(MemoryBarrierMask.ShaderStorageBarrierBit);
-
-    //             // Blur passes - one for each axis
-    //             blurShader.SetUniform("chunkSize", chunkManager.ChunkSize);
-    //             blurShader.SetUniform("voxelSize", chunkManager.VoxelSize);
-    //             blurShader.SetUniform("currentChunk", c);
-
-    //             // Perform three blur passes (X, Y, Z axes)
-    //             for (int pass = 0; pass < 3; pass++)
-    //             {
-    //                 blurShader.SetUniform("pass", pass);
-    //                 blurShader.Dispatch(numGroups, numGroups, numGroups);
-    //             }
-    //         }
-
-    //         lightingChunk = (lightingChunk + 1) % ChunkManager.MAX_CHUNKS;
-    //     });
-    // }
-
-    public async void Draw(double dt)
+    private void HandleResize(Vector2D<int> newSize)
     {
-        // await UpdateChunks();
+        if (newSize == currentSize) return;
 
+        currentSize = newSize;
+        ctx.ExecuteCmd((dt, gl) =>
+        {
+            DeleteFramebufferResources(gl);
+            CreateFramebufferResources();
+        });
+    }
+
+    private unsafe void CreateFramebufferResources()
+    {
+        ctx.ExecuteCmd((dt, gl) =>
+        {
+            // Create Geometry FBO
+            gl.CreateFramebuffers(1, out geometryFbo);
+            gl.BindFramebuffer(FramebufferTarget.Framebuffer, geometryFbo);
+
+            // Create Post-process FBO
+            gl.CreateFramebuffers(1, out postFbo);
+
+            // Create geometry pass textures
+            CreateTexture(gl, ref colorTexture, GLEnum.Rgba32f);
+            CreateTexture(gl, ref normalTexture, GLEnum.Rgba16f);
+            CreateTexture(gl, ref depthTexture, GLEnum.R32f);
+            CreateTexture(gl, ref aoTexture, GLEnum.R16f);
+            CreateTexture(gl, ref materialTexture, GLEnum.R8ui);
+
+            // Create post-process textures
+            CreateTexture(gl, ref tempAoTexture, GLEnum.R16f);
+            CreateTexture(gl, ref denoisedAoTexture, GLEnum.R16f);
+            CreateTexture(gl, ref shadowTexture, GLEnum.R16f);
+            CreateTexture(gl, ref compositedTexture, GLEnum.Rgba8);
+            CreateTexture(gl, ref motionTexture, GLEnum.RG16f);
+
+            // Attach textures to geometry FBO
+            gl.NamedFramebufferTexture(geometryFbo, FramebufferAttachment.ColorAttachment0, colorTexture, 0);
+            gl.NamedFramebufferTexture(geometryFbo, FramebufferAttachment.ColorAttachment1, normalTexture, 0);
+            gl.NamedFramebufferTexture(geometryFbo, FramebufferAttachment.ColorAttachment2, depthTexture, 0);
+            gl.NamedFramebufferTexture(geometryFbo, FramebufferAttachment.ColorAttachment3, aoTexture, 0);
+            gl.NamedFramebufferTexture(geometryFbo, FramebufferAttachment.ColorAttachment4, materialTexture, 0);
+
+            // Attach textures to post FBO
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment0, tempAoTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment1, denoisedAoTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment2, shadowTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment3, compositedTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment4, motionTexture, 0);
+
+            // Enable draw buffers for geometry FBO
+            GLEnum[] geometryBuffers = {
+                GLEnum.ColorAttachment0,
+                GLEnum.ColorAttachment1,
+                GLEnum.ColorAttachment2,
+                GLEnum.ColorAttachment3,
+                GLEnum.ColorAttachment4
+            };
+            gl.NamedFramebufferDrawBuffers(geometryFbo, 5, geometryBuffers);
+
+            // Enable draw buffers for post FBO
+            GLEnum[] postBuffers = {
+                GLEnum.ColorAttachment0,
+                GLEnum.ColorAttachment1,
+                GLEnum.ColorAttachment2,
+                GLEnum.ColorAttachment3,
+                GLEnum.ColorAttachment4
+            };
+            gl.NamedFramebufferDrawBuffers(postFbo, 5, postBuffers);
+
+            // Verify framebuffers are complete
+            if (gl.CheckNamedFramebufferStatus(geometryFbo, FramebufferTarget.Framebuffer) != GLEnum.FramebufferComplete)
+                throw new Exception("Geometry framebuffer is incomplete!");
+            if (gl.CheckNamedFramebufferStatus(postFbo, FramebufferTarget.Framebuffer) != GLEnum.FramebufferComplete)
+                throw new Exception("Post-process framebuffer is incomplete!");
+        });
+    }
+
+    private unsafe void CreateTexture(GL gl, ref uint texture, GLEnum format)
+    {
+        gl.CreateTextures(TextureTarget.Texture2D, 1, out texture);
+        gl.TextureStorage2D(texture, 1, format, (uint)currentSize.X, (uint)currentSize.Y);
+        gl.TextureParameter(texture, TextureParameterName.TextureMinFilter, (int)GLEnum.Linear);
+        gl.TextureParameter(texture, TextureParameterName.TextureMagFilter, (int)GLEnum.Linear);
+        gl.TextureParameter(texture, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+        gl.TextureParameter(texture, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+    }
+
+    private unsafe void DeleteFramebufferResources(GL gl)
+    {
+        if (geometryFbo != 0)
+        {
+            gl.DeleteFramebuffer(geometryFbo);
+            gl.DeleteFramebuffer(postFbo);
+            gl.DeleteTexture(colorTexture);
+            gl.DeleteTexture(normalTexture);
+            gl.DeleteTexture(depthTexture);
+            gl.DeleteTexture(aoTexture);
+            gl.DeleteTexture(materialTexture);
+            gl.DeleteTexture(tempAoTexture);
+            gl.DeleteTexture(denoisedAoTexture);
+            gl.DeleteTexture(shadowTexture);
+            gl.DeleteTexture(compositedTexture);
+            gl.DeleteTexture(motionTexture);
+        }
+    }
+
+    private void DispatchSandSimulation(GL gl, double dt)
+    {
+        // Set uniforms
+        sandSimShader.SetUniform("deltaTime", dt);
+
+        // Calculate dispatch size for 1/27th (3^3) of the volume
+        uint totalSize = ChunkManager.ChunkSize * ChunkManager.GridSize * ChunkManager.ChunkSize;
+        totalSize = (uint)Math.Ceiling(totalSize / 3f);
+
+        // Calculate work groups based on the local size (8x8x8)
+        uint groupsX = (totalSize + 7) / 8;
+        uint groupsY = (totalSize + 7) / 8;
+        uint groupsZ = (totalSize + 7) / 8;
+
+        // Dispatch the compute shader
+        for (int i = 0; i < 4; i++)
+        {
+            sandSimShader.Use();
+            sandSimShader.SetUniform("frameNumber", currentFrame);
+            sandSimShader.SetUniform("passIndex", currentFrame % PASSES);
+            sandSimShader.Dispatch(groupsX, groupsY, groupsZ);
+            currentFrame++;
+        }
+    }
+
+    bool clicked = false;
+    public int selectedMaterial = 1; // from 1 to ChunkManager.Materials.Length - 1
+    public int placeSize = 4;
+
+    public void Draw(double dt)
+    {
         ctx.RenderCmd((dt, gl) =>
         {
-            // CalculateLighting();
-            // OptimizeOctrees();
+            chunkManager.BindBuffers(gl);
+            hoveredCastResult = raycastSystem.Raycast(camera.Position, camera.Forward).hits[0];
 
-            // voxelShader.Use();
-            // voxelShader.SetUniform("time", (float)window.context.Time);
-            // voxelShader.SetUniform("resolution", window.Size);
-            // voxelShader.SetUniform("mouse", window.context.Input.Mice[0].Position);
-            // voxelShader.SetUniform("view", camera.ViewMatrix);
-            // voxelShader.SetUniform("projection", camera.PerspectiveMatrix);
-            // voxelShader.SetUniform("near", camera.Near);
-            // voxelShader.SetUniform("far", camera.Far);
-            // voxelShader.SetUniform("sunDir", sunDirection);
-            // voxelShader.SetUniform("sunColor", sunColor);
-            // voxelShader.SetUniform("chunkSize", chunkManager.ChunkSize);
-            // voxelShader.SetUniform("voxelSize", chunkManager.VoxelSize);
-            // voxelShader.SetUniform("maxChunkCount", ChunkManager.MAX_CHUNKS);
+            Vector3 cornerPos = hoveredCastResult.cellPosition;
+        
+            Vector3 size = new Vector3(placeSize, placeSize, placeSize);
+            cornerPos = new Vector3(
+                (float)Math.Floor(cornerPos.X / size.X) * size.X,
+                (float)Math.Floor(cornerPos.Y / size.Y) * size.Y,
+                (float)Math.Floor(cornerPos.Z / size.Z) * size.Z
+            );
+            
+            
+            // if mouse down and raycast hit, place voxel
+            if (!clicked && ctx.Input.Mice[0].IsButtonPressed(MouseButton.Right) && hoveredCastResult.valid)
+            {
+                cornerPos += hoveredCastResult.normal * size;
+                voxelEditorSystem.PlaceVoxels(cornerPos, size, selectedMaterial);
+                clicked = true;
+            }
 
-            // chunkManager.BindBuffers(0, 1, 2, 3, 4, 5);
+            if (!clicked && ctx.Input.Mice[0].IsButtonPressed(MouseButton.Left) && hoveredCastResult.valid)
+            {
+                voxelEditorSystem.ClearVoxels(cornerPos, size);
+                clicked = true;
+            }
 
+            if (!ctx.Input.Mice[0].IsButtonPressed(MouseButton.Left) && !ctx.Input.Mice[0].IsButtonPressed(MouseButton.Right))
+            {
+                clicked = false;
+            }
+
+            // if mouse wheel is scrolled, change selected material 
+            if (ctx.Input.Mice[0].ScrollWheels[0].Y != 0)
+            {
+                if (ctx.Input.Keyboards[0].IsKeyPressed(Key.ShiftLeft))
+                {
+                    // move by powers of 2
+                    if ((int)ctx.Input.Mice[0].ScrollWheels[0].Y > 0)
+                    {
+                        placeSize *= 2;
+                    }
+                    else
+                    {
+                        placeSize /= 2;
+                    }
+
+                    if (placeSize < 1)
+                    {
+                        placeSize = 1;
+                    }
+                    if (placeSize > 1024)
+                    {
+                        placeSize = 1024;
+                    }
+                }
+                else
+                {
+                    selectedMaterial += (int)ctx.Input.Mice[0].ScrollWheels[0].Y;
+                    if (selectedMaterial < 1)
+                    {
+                        selectedMaterial = 1;
+                    }
+                    if (selectedMaterial >= Materials.materials.Length)
+                    {
+                        selectedMaterial = Materials.materials.Length - 1;
+                    }
+                }
+            }
+            
+            // Generate chunks if needed
+            if (isGenerating && generatedChunks < ChunkManager.NumChunks / 2)
+            {
+                chunkManager.GenerateChunkTerrain(ctx, ChunksPerFrame);
+                generatedChunks += (ulong)ChunksPerFrame;
+
+                if (generatedChunks >= ChunkManager.NumChunks / 2)
+                {
+                    Console.WriteLine("Finished generating chunks");
+                    isGenerating = false;
+                }
+            }
+
+            DispatchSandSimulation(gl, dt);
+
+            uint workGroupsX = (uint)((currentSize.X + 15) / 16);
+            uint workGroupsY = (uint)((currentSize.Y + 15) / 16);
+
+            // Geometry pass
+            gl.BindFramebuffer(FramebufferTarget.Framebuffer, geometryFbo);
+            {
+                gl.BindImageTexture(0, colorTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.Rgba32f);
+                gl.BindImageTexture(1, normalTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.Rgba16f);
+                gl.BindImageTexture(2, depthTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.R32f);
+                gl.BindImageTexture(3, aoTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.R16f);
+                gl.BindImageTexture(4, materialTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.R8ui);
+                gl.BindImageTexture(5, shadowTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.R16f);
+                gl.BindImageTexture(6, motionTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.RG16f);
+
+                renderShader.Use();
+                SetupRenderUniforms();
+                renderShader.Dispatch(workGroupsX, workGroupsY, 1);
+            }
+
+            // Denoising passes
+            gl.BindFramebuffer(FramebufferTarget.Framebuffer, postFbo);
+            {
+                // Bind textures for denoising
+                gl.BindImageTexture(1, normalTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.Rgba16f);
+                gl.BindImageTexture(2, depthTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R32f);
+                gl.BindImageTexture(3, aoTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R16f);
+                gl.BindImageTexture(4, tempAoTexture, 0, false, 0, BufferAccessARB.ReadWrite, InternalFormat.R16f);
+                gl.BindImageTexture(5, denoisedAoTexture, 0, false, 0, BufferAccessARB.ReadWrite, InternalFormat.R16f);
+                gl.BindImageTexture(6, motionTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.RG16f);
+                
+                denoiseShader.Use();
+                
+                // Initial copy pass
+                denoiseShader.SetUniform("pass", 0);
+                denoiseShader.Dispatch(workGroupsX, workGroupsY, 1);
+
+                // Multiple filtering passes with decreasing kernel sizes
+                float[] kernelScales = new[] { 1.0f, 0.75f, 0.5f };
+                foreach (float scale in kernelScales)
+                {
+                    // Horizontal pass
+                    denoiseShader.SetUniform("pass", 1);
+                    denoiseShader.SetUniform("filterSize", scale);
+                    denoiseShader.Dispatch(workGroupsX, workGroupsY, 1);
+
+                    // Vertical pass
+                    denoiseShader.SetUniform("pass", 2);
+                    denoiseShader.SetUniform("filterSize", scale);
+                    denoiseShader.Dispatch(workGroupsX, workGroupsY, 1);
+                }
+            }
+
+            // Composite pass
+            {
+                // Bind input textures
+                gl.BindImageTexture(0, colorTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.Rgba32f);
+                gl.BindImageTexture(1, normalTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.Rgba16f);
+                gl.BindImageTexture(2, depthTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R32f);
+                gl.BindImageTexture(3, denoisedAoTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R16f);
+                gl.BindImageTexture(4, materialTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R8ui);
+                gl.BindImageTexture(5, shadowTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R16f);
+                gl.BindImageTexture(6, compositedTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.Rgba8);
+
+                compositeShader.Use();
+                compositeShader.SetUniform("sunDir", sunDirection);
+                compositeShader.SetUniform("sunColor", sunColor);
+                compositeShader.SetUniform("cameraPos", camera.Position);
+                compositeShader.SetUniform("viewMatrix", camera.ViewMatrix);
+                compositeShader.SetUniform("projMatrix", camera.PerspectiveMatrix);
+                compositeShader.Dispatch(workGroupsX, workGroupsY, 1);
+            }
+
+            // Final blit to screen
+            gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+            gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+            
+            blitShader.Use();
+            gl.BindTextureUnit(0, compositedTexture);
+            blitShader.SetUniform("tex", 0);
             screenQuad.Draw();
+
+            // Store current frame data for next frame's motion vectors
+            prevViewProjectionMatrix = camera.ViewMatrix * camera.PerspectiveMatrix;
+            prevCameraPosition = camera.Position;
         });
+    }
+
+    private void SetupRenderUniforms()
+    {
+        renderShader.SetUniform("viewMatrix", camera.ViewMatrix);
+        renderShader.SetUniform("projMatrix", camera.PerspectiveMatrix);
+        renderShader.SetUniform("cameraPos", camera.Position);
+        renderShader.SetUniform("prevViewProjMatrix", prevViewProjectionMatrix);
+        renderShader.SetUniform("prevCameraPos", prevCameraPosition);
+        renderShader.SetUniform("sunDir", sunDirection);
+        renderShader.SetUniform("sunColor", sunColor);
+        renderShader.SetUniform("time", (float)window.SilkWindow.Time);
     }
 
     public void Dispose()
     {
+        window.SilkWindow.Resize -= HandleResize;
+
         ctx.ExecuteCmd((dt, gl) =>
         {
-            // chunkManager.Dispose();
-
-            // directLightingShader.Dispose();
-            // blurShader.Dispose();
-            // sandPhysicsShader.Dispose();
-            // octreeOptimizeShader.Dispose();
-
-            // if (moveFlags != 0) gl.DeleteBuffer(moveFlags);
-            // if (changesBuffer != 0) gl.DeleteBuffer(changesBuffer);
-
-            // voxelShader?.Dispose();
-            // screenQuad?.Dispose();
-            // ssao?.Dispose();
+            renderShader?.Dispose();
+            sandSimShader?.Dispose();
+            denoiseShader?.Dispose();
+            compositeShader?.Dispose();
+            blitShader?.Dispose();
+            DeleteFramebufferResources(gl);
+            chunkManager.Dispose(gl);
+            screenQuad?.Dispose();
         });
     }
-
 }

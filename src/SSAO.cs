@@ -1,7 +1,7 @@
 using System.Numerics;
 using Engine;
 using Silk.NET.OpenGL;
-using Shader = Engine.Shader;
+using MeshShader = Engine.MeshShader;
 
 
 public class SSAORenderer : IDisposable
@@ -14,8 +14,8 @@ public class SSAORenderer : IDisposable
 
     private GL gl;
     private GLContext ctx;
-    private Shader ssaoShader;
-    private Shader blurShader;
+    private MeshShader ssaoShader;
+    private MeshShader blurShader;
     private Vector3[] ssaoKernel;
 
     private Mesh screenQuad;
@@ -146,8 +146,8 @@ public class SSAORenderer : IDisposable
     /// </summary>
     private void LoadShaders()
     {
-        ssaoShader = new Shader(ctx, "shaders/vert.glsl", "shaders/ssao-frag.glsl");
-        blurShader = new Shader(ctx, "shaders/vert.glsl", "shaders/blur-frag.glsl");
+        ssaoShader = new MeshShader(ctx, "shaders/vert.glsl", "shaders/ssao-frag.glsl");
+        blurShader = new MeshShader(ctx, "shaders/vert.glsl", "shaders/blur-frag.glsl");
     }
 
     /// <summary>

@@ -50,23 +50,25 @@ public class GLContext
 
     public void ExecuteCmd(Action<double, GL> action)
     {
-        if (Thread.CurrentThread == glThread)
+        if (IsCurrent)
         {
             action(CurentDeltaTime, gl);
+            return;
         }
         updateQueue.Enqueue(action);
     }
 
     public void RenderCmd(Action<double, GL> action)
     {
-        if (Thread.CurrentThread == glThread)
+        if (IsCurrent)
         {
             action(CurentDeltaTime, gl);
-
-            
+            return;
         }
         renderQueue.Enqueue(action);
     }
+
+    public bool IsCurrent => Thread.CurrentThread == glThread;
 
     public static implicit operator GL(GLContext c) => c.gl;
 }
