@@ -2,6 +2,10 @@
 
 Voxy Engine is a raymarched mini voxel engine / game project. 
 
+Please note that this is a hobby project and the code is probably messy, unorganized, and unoptimized.
+<br>
+However, feel free to give advice or submit a PR if you would like :)
+
 ## Features
 - A dynamic, falling sand simulated world
 - Transparent and textured materials
