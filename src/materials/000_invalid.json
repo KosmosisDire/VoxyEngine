@@ -1,0 +1,45 @@
+{
+    "name": "Invalid",
+    "properties": {
+        "color1": {
+            "r": 1.0,
+            "g": 0.0,
+            "b": 1.0,
+            "controlPoint": 0.0
+        },
+        "color2": {
+            "r": 0.8,
+            "g": 0.0,
+            "b": 0.8,
+            "controlPoint": 1.0
+        },
+        "color3": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "color4": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "noiseSize": 0.0,
+        "noiseStrength": 0.0,
+        "texture1Id": 0,
+        "texture2Id": 0,
+        "textureBlend": 0.0,
+        "blendWithNoise": false,
+        "isPowder": false,
+        "isLiquid": false,
+        "isCollidable": true,
+        "roughness": 0.0,
+        "shininess": 0.5,
+        "specularStrength": 0.5,
+        "reflectivity": 0.0,
+        "transparency": 0.0,
+        "refractiveIndex": 1.0,
+        "emission": 0.0
+    }
+}

@@ -30,6 +30,8 @@ public class VoxelRenderer : IDisposable
 
     // Post-process textures
     private uint tempAoTexture;
+    private uint varianceTexture;  // Added for SVGF
+    private uint momentsTexture;   // Added for SVGF
     private uint denoisedAoTexture;
     private uint shadowTexture;
     private uint compositedTexture;
@@ -38,8 +40,7 @@ public class VoxelRenderer : IDisposable
     private Vector2D<int> currentSize;
 
     // Lighting parameters
-    private Vector3 sunDirection = new(0.7f, 0.5f, 0.5f);
-    private Vector3 sunColor = new(1f, 0.95f, 0.8f);
+    private Vector3 sunDirection = new(0.01f, 1.0f, 0.05f);
 
     // Previous frame camera data for motion vectors
     private Matrix4x4 prevViewProjectionMatrix;
@@ -61,6 +62,7 @@ public class VoxelRenderer : IDisposable
     public RaycastHit hoveredCastResult;
     public RaycastSystem raycastSystem;
     public VoxelEditorSystem voxelEditorSystem;
+    private BitmaskGenerator maskGenerator;
 
     public unsafe VoxelRenderer(Window window, Camera camera)
     {
@@ -78,6 +80,7 @@ public class VoxelRenderer : IDisposable
         screenQuad = MeshGen.Quad(ctx);
         screenQuad.CreateFlattenedBuffers();
         screenQuad.UploadBuffers();
+        maskGenerator = new BitmaskGenerator(ctx);
 
         // Initialize shaders
         renderShader = new ComputeShader(ctx, "shaders/raymarch.comp.glsl");
@@ -97,6 +100,8 @@ public class VoxelRenderer : IDisposable
 
         // Subscribe to window resize
         window.SilkWindow.Resize += HandleResize;
+
+        // chunkManager.GenerateAllTerrainCPU(ctx);
     }
 
     private void HandleResize(Vector2D<int> newSize)
@@ -131,7 +136,8 @@ public class VoxelRenderer : IDisposable
 
             // Create post-process textures
             CreateTexture(gl, ref tempAoTexture, GLEnum.R16f);
-            CreateTexture(gl, ref denoisedAoTexture, GLEnum.R16f);
+            CreateTexture(gl, ref varianceTexture, GLEnum.R32f);  // Added for SVGF
+            CreateTexture(gl, ref momentsTexture, GLEnum.RG32f);  // Added for SVGF
             CreateTexture(gl, ref shadowTexture, GLEnum.R16f);
             CreateTexture(gl, ref compositedTexture, GLEnum.Rgba8);
             CreateTexture(gl, ref motionTexture, GLEnum.RG16f);
@@ -145,10 +151,11 @@ public class VoxelRenderer : IDisposable
 
             // Attach textures to post FBO
             gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment0, tempAoTexture, 0);
-            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment1, denoisedAoTexture, 0);
-            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment2, shadowTexture, 0);
-            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment3, compositedTexture, 0);
-            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment4, motionTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment1, varianceTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment2, momentsTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment3, shadowTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment4, compositedTexture, 0);
+            gl.NamedFramebufferTexture(postFbo, FramebufferAttachment.ColorAttachment5, motionTexture, 0);
 
             // Enable draw buffers for geometry FBO
             GLEnum[] geometryBuffers = {
@@ -166,9 +173,10 @@ public class VoxelRenderer : IDisposable
                 GLEnum.ColorAttachment1,
                 GLEnum.ColorAttachment2,
                 GLEnum.ColorAttachment3,
-                GLEnum.ColorAttachment4
+                GLEnum.ColorAttachment4,
+                GLEnum.ColorAttachment5
             };
-            gl.NamedFramebufferDrawBuffers(postFbo, 5, postBuffers);
+            gl.NamedFramebufferDrawBuffers(postFbo, 6, postBuffers);
 
             // Verify framebuffers are complete
             if (gl.CheckNamedFramebufferStatus(geometryFbo, FramebufferTarget.Framebuffer) != GLEnum.FramebufferComplete)
@@ -200,7 +208,8 @@ public class VoxelRenderer : IDisposable
             gl.DeleteTexture(aoTexture);
             gl.DeleteTexture(materialTexture);
             gl.DeleteTexture(tempAoTexture);
-            gl.DeleteTexture(denoisedAoTexture);
+            gl.DeleteTexture(varianceTexture);
+            gl.DeleteTexture(momentsTexture);
             gl.DeleteTexture(shadowTexture);
             gl.DeleteTexture(compositedTexture);
             gl.DeleteTexture(motionTexture);
@@ -209,24 +218,35 @@ public class VoxelRenderer : IDisposable
 
     private void DispatchSandSimulation(GL gl, double dt)
     {
-        // Set uniforms
-        sandSimShader.SetUniform("deltaTime", dt);
+        const float BASE_RADIUS = 3.0f;  // Base radius in chunk sizes
+        const float SCALE_FACTOR = 3f; // How much to increase radius each pass
+        const int NUM_PASSES = 1;        // Number of progressive passes
 
-        // Calculate dispatch size for 1/27th (3^3) of the volume
-        uint totalSize = ChunkManager.ChunkSize * ChunkManager.GridSize * ChunkManager.ChunkSize;
-        totalSize = (uint)Math.Ceiling(totalSize / 3f);
-
-        // Calculate work groups based on the local size (8x8x8)
-        uint groupsX = (totalSize + 7) / 8;
-        uint groupsY = (totalSize + 7) / 8;
-        uint groupsZ = (totalSize + 7) / 8;
-
-        // Dispatch the compute shader
-        for (int i = 0; i < 4; i++)
+        for (int pass = 0; pass < NUM_PASSES; pass++)
         {
+            float currentScale = (float)Math.Pow(SCALE_FACTOR, pass);
+            uint areaRadius = (uint)(BASE_RADIUS * ChunkManager.ChunkSize * ChunkManager.ChunkSize * currentScale);
+            Vector3I camPos = camera.Position * ChunkManager.ChunkSize * ChunkManager.ChunkSize;
+            Vector3I forwardOffset = new Vector3I(camera.Forward * areaRadius * 0.9f);
+            Vector3I minCoord = camPos - new Vector3I(areaRadius) + forwardOffset;
+            Vector3I maxCoord = camPos + new Vector3I(areaRadius) + forwardOffset;
+            Vector3I size = maxCoord - minCoord;
+
+            // Calculate work groups based on the local size (8x8x8)
+            uint groupsX = (uint)(size.X + 7) / 8;
+            uint groupsY = (uint)(size.Y + 7) / 8;
+            uint groupsZ = (uint)(size.Z + 7) / 8;
+
             sandSimShader.Use();
+            sandSimShader.SetUniform("minCoord", minCoord);
+            sandSimShader.SetUniform("maxCoord", maxCoord);
+            sandSimShader.SetUniform("deltaTime", dt);
+            sandSimShader.SetUniform("currentScale", currentScale);
+            sandSimShader.SetUniform("cameraPos", camPos);
+            sandSimShader.SetUniform("cameraDir", camera.Forward);
             sandSimShader.SetUniform("frameNumber", currentFrame);
-            sandSimShader.SetUniform("passIndex", currentFrame % PASSES);
+
+            // Dispatch the compute shader for this pass
             sandSimShader.Dispatch(groupsX, groupsY, groupsZ);
             currentFrame++;
         }
@@ -238,21 +258,25 @@ public class VoxelRenderer : IDisposable
 
     public void Draw(double dt)
     {
+        // rotate sun around x axis
+        sunDirection = Vector3.TransformNormal(sunDirection, Matrix4x4.CreateFromAxisAngle(Vector3.UnitX, 0.0005f));
+
         ctx.RenderCmd((dt, gl) =>
         {
             chunkManager.BindBuffers(gl);
+            maskGenerator.BindBuffer(gl);
             hoveredCastResult = raycastSystem.Raycast(camera.Position, camera.Forward).hits[0];
 
             Vector3 cornerPos = hoveredCastResult.cellPosition;
-        
+
             Vector3 size = new Vector3(placeSize, placeSize, placeSize);
             cornerPos = new Vector3(
                 (float)Math.Floor(cornerPos.X / size.X) * size.X,
                 (float)Math.Floor(cornerPos.Y / size.Y) * size.Y,
                 (float)Math.Floor(cornerPos.Z / size.Z) * size.Z
             );
-            
-            
+
+
             // if mouse down and raycast hit, place voxel
             if (!clicked && ctx.Input.Mice[0].IsButtonPressed(MouseButton.Right) && hoveredCastResult.valid)
             {
@@ -275,7 +299,7 @@ public class VoxelRenderer : IDisposable
             // if mouse wheel is scrolled, change selected material 
             if (ctx.Input.Mice[0].ScrollWheels[0].Y != 0)
             {
-                if (ctx.Input.Keyboards[0].IsKeyPressed(Key.ShiftLeft))
+                if (ctx.Input.Keyboards[0].IsKeyPressed(Key.ControlLeft))
                 {
                     // move by powers of 2
                     if ((int)ctx.Input.Mice[0].ScrollWheels[0].Y > 0)
@@ -309,14 +333,14 @@ public class VoxelRenderer : IDisposable
                     }
                 }
             }
-            
+
             // Generate chunks if needed
-            if (isGenerating && generatedChunks < ChunkManager.NumChunks / 2)
+            if (isGenerating && generatedChunks < ChunkManager.NumChunks)
             {
                 chunkManager.GenerateChunkTerrain(ctx, ChunksPerFrame);
                 generatedChunks += (ulong)ChunksPerFrame;
 
-                if (generatedChunks >= ChunkManager.NumChunks / 2)
+                if (generatedChunks >= ChunkManager.NumChunks)
                 {
                     Console.WriteLine("Finished generating chunks");
                     isGenerating = false;
@@ -345,37 +369,31 @@ public class VoxelRenderer : IDisposable
             }
 
             // Denoising passes
-            gl.BindFramebuffer(FramebufferTarget.Framebuffer, postFbo);
-            {
-                // Bind textures for denoising
-                gl.BindImageTexture(1, normalTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.Rgba16f);
-                gl.BindImageTexture(2, depthTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R32f);
-                gl.BindImageTexture(3, aoTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R16f);
-                gl.BindImageTexture(4, tempAoTexture, 0, false, 0, BufferAccessARB.ReadWrite, InternalFormat.R16f);
-                gl.BindImageTexture(5, denoisedAoTexture, 0, false, 0, BufferAccessARB.ReadWrite, InternalFormat.R16f);
-                gl.BindImageTexture(6, motionTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.RG16f);
-                
-                denoiseShader.Use();
-                
-                // Initial copy pass
-                denoiseShader.SetUniform("pass", 0);
-                denoiseShader.Dispatch(workGroupsX, workGroupsY, 1);
+            // gl.BindFramebuffer(FramebufferTarget.Framebuffer, postFbo);
+            // {
+            //     // Bind textures for SVGF denoising
+            //     gl.BindImageTexture(0, normalTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.Rgba16f);
+            //     gl.BindImageTexture(1, depthTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R32f);
+            //     gl.BindImageTexture(2, aoTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R16f);
+            //     gl.BindImageTexture(3, motionTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.RG16f);
+            //     gl.BindImageTexture(4, tempAoTexture, 0, false, 0, BufferAccessARB.ReadWrite, InternalFormat.R16f);
+            //     gl.BindImageTexture(5, varianceTexture, 0, false, 0, BufferAccessARB.ReadWrite, InternalFormat.R32f);
+            //     gl.BindImageTexture(6, momentsTexture, 0, false, 0, BufferAccessARB.ReadWrite, InternalFormat.RG32f);
 
-                // Multiple filtering passes with decreasing kernel sizes
-                float[] kernelScales = new[] { 1.0f, 0.75f, 0.5f };
-                foreach (float scale in kernelScales)
-                {
-                    // Horizontal pass
-                    denoiseShader.SetUniform("pass", 1);
-                    denoiseShader.SetUniform("filterSize", scale);
-                    denoiseShader.Dispatch(workGroupsX, workGroupsY, 1);
+            //     denoiseShader.Use();
 
-                    // Vertical pass
-                    denoiseShader.SetUniform("pass", 2);
-                    denoiseShader.SetUniform("filterSize", scale);
-                    denoiseShader.Dispatch(workGroupsX, workGroupsY, 1);
-                }
-            }
+            //     // Pass 0: Temporal accumulation
+            //     denoiseShader.SetUniform("pass", -1);
+            //     denoiseShader.Dispatch(workGroupsX, workGroupsY, 1);
+
+            //     // Passes 1-5: A-trous wavelet passes
+            //     for (int i = 0; i <= 4; i++)
+            //     {
+            //         denoiseShader.SetUniform("pass", i);
+            //         denoiseShader.Dispatch(workGroupsX, workGroupsY, 1);
+            //     }
+            // }
+
 
             // Composite pass
             {
@@ -383,24 +401,25 @@ public class VoxelRenderer : IDisposable
                 gl.BindImageTexture(0, colorTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.Rgba32f);
                 gl.BindImageTexture(1, normalTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.Rgba16f);
                 gl.BindImageTexture(2, depthTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R32f);
-                gl.BindImageTexture(3, denoisedAoTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R16f);
+                gl.BindImageTexture(3, aoTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R16f);
                 gl.BindImageTexture(4, materialTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R8ui);
                 gl.BindImageTexture(5, shadowTexture, 0, false, 0, BufferAccessARB.ReadOnly, InternalFormat.R16f);
                 gl.BindImageTexture(6, compositedTexture, 0, false, 0, BufferAccessARB.WriteOnly, InternalFormat.Rgba8);
 
+
                 compositeShader.Use();
-                compositeShader.SetUniform("sunDir", sunDirection);
-                compositeShader.SetUniform("sunColor", sunColor);
-                compositeShader.SetUniform("cameraPos", camera.Position);
                 compositeShader.SetUniform("viewMatrix", camera.ViewMatrix);
                 compositeShader.SetUniform("projMatrix", camera.PerspectiveMatrix);
+                compositeShader.SetUniform("cameraPos", camera.Position);
+                compositeShader.SetUniform("sunDir", sunDirection);
+                compositeShader.SetUniform("time", (float)window.SilkWindow.Time);
                 compositeShader.Dispatch(workGroupsX, workGroupsY, 1);
             }
 
             // Final blit to screen
             gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
             gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
-            
+
             blitShader.Use();
             gl.BindTextureUnit(0, compositedTexture);
             blitShader.SetUniform("tex", 0);
@@ -420,7 +439,6 @@ public class VoxelRenderer : IDisposable
         renderShader.SetUniform("prevViewProjMatrix", prevViewProjectionMatrix);
         renderShader.SetUniform("prevCameraPos", prevCameraPosition);
         renderShader.SetUniform("sunDir", sunDirection);
-        renderShader.SetUniform("sunColor", sunColor);
         renderShader.SetUniform("time", (float)window.SilkWindow.Time);
     }
 
@@ -434,10 +452,17 @@ public class VoxelRenderer : IDisposable
             sandSimShader?.Dispose();
             denoiseShader?.Dispose();
             compositeShader?.Dispose();
+            maskGenerator?.Dispose();
             blitShader?.Dispose();
+
             DeleteFramebufferResources(gl);
             chunkManager.Dispose(gl);
             screenQuad?.Dispose();
+
+            raycastSystem?.Dispose();
+            voxelEditorSystem?.Dispose();
         });
+
+        GC.SuppressFinalize(this);
     }
 }

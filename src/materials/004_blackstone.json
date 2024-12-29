@@ -1,0 +1,45 @@
+{
+    "name": "BlackStone",
+    "properties": {
+        "color1": {
+            "r": 0.15,
+            "g": 0.15,
+            "b": 0.15,
+            "controlPoint": 0.0
+        },
+        "color2": {
+            "r": 0.12,
+            "g": 0.12,
+            "b": 0.12,
+            "controlPoint": 0.5
+        },
+        "color3": {
+            "r": 0.18,
+            "g": 0.18,
+            "b": 0.18,
+            "controlPoint": 1.0
+        },
+        "color4": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "noiseSize": 0.15,
+        "noiseStrength": 0.04,
+        "texture1Id": 0,
+        "texture2Id": 0,
+        "textureBlend": 0.0,
+        "blendWithNoise": false,
+        "isPowder": false,
+        "isLiquid": false,
+        "isCollidable": true,
+        "roughness": 0.01,
+        "shininess": 0.4,
+        "specularStrength": 0.3,
+        "reflectivity": 0.005,
+        "transparency": 0.0,
+        "refractiveIndex": 1.0,
+        "emission": 0.0
+    }
+}

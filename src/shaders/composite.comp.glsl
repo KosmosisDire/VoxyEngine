@@ -16,18 +16,19 @@ layout(r16f, binding = 5) uniform readonly image2D shadowTex;
 layout(rgba8, binding = 6) uniform writeonly image2D outputTex;
 
 // Lighting uniforms
-uniform vec3 sunDir;
-uniform vec3 sunColor;
 uniform vec3 cameraPos;
 uniform mat4 viewMatrix;
 uniform mat4 projMatrix;
 
-// Indirect lighting parameters
-const vec3 ambientColor = vec3(0.84, 1, 0.98);
-const float ambientStrength = 0.4;
+#include "atmosphere.glsl"
+
+// Normal blur parameters
+const float NORMAL_BLUR_RADIUS = 0.0;
+const float NORMAL_BLUR_SIGMA = 2.0;
+const float DEPTH_SENSITIVITY = 10000.0;  // Adjust to control how much depth differences affect the blur
 
 // Tone mapping parameters
-const float exposure = 1.1;
+const float exposure = 1.3;
 
 const int CROSSHAIR_SIZE = 10;
 const int CROSSHAIR_THICKNESS = 2;
@@ -59,6 +60,63 @@ bool isPartOfCrosshair(ivec2 pixel, ivec2 screenSize) {
     return horizontalPart || verticalPart;
 }
 
+float getLinearDepth(float depth, mat4 proj) {
+    float near = proj[3][2] / (proj[2][2] - 1.0);
+    float far = proj[3][2] / (proj[2][2] + 1.0);
+    return (2.0 * near) / (far + near - depth * (far - near));
+}
+
+vec3 sampleNormalWithOffset(ivec2 pixel, ivec2 offset, ivec2 screenSize) {
+    ivec2 samplePos = clamp(pixel + offset, ivec2(0), screenSize - ivec2(1));
+    return imageLoad(normalsTex, samplePos).xyz * 2.0 - 1.0;
+}
+
+float sampleDepthWithOffset(ivec2 pixel, ivec2 offset, ivec2 screenSize) {
+    ivec2 samplePos = clamp(pixel + offset, ivec2(0), screenSize - ivec2(1));
+    return imageLoad(depthTex, samplePos).r;
+}
+
+vec3 blurNormal(ivec2 pixel, ivec2 screenSize) {
+    vec3 blurredNormal = vec3(0.0);
+    float totalWeight = 0.0;
+    
+    // Get center depth
+    float centerDepth = getLinearDepth(imageLoad(depthTex, pixel).r, projMatrix);
+    
+    // Use the actual radius parameter
+    int radius = int(ceil(NORMAL_BLUR_RADIUS));
+    
+    // Sample in a square with the specified radius
+    for(int x = -radius; x <= radius; x++) {
+        for(int y = -radius; y <= radius; y++) {
+            vec2 offset = vec2(x, y);
+            float distance = length(offset);
+            
+            // Skip samples outside the circular radius
+            if (distance > NORMAL_BLUR_RADIUS) continue;
+            
+            // Get sample depth
+            float sampleDepth = getLinearDepth(sampleDepthWithOffset(pixel, ivec2(x, y), screenSize), projMatrix);
+            
+            // Calculate depth difference weight
+            float depthDiff = abs(centerDepth - sampleDepth);
+            float depthWeight = exp(-depthDiff * DEPTH_SENSITIVITY);
+            
+            // Combine spatial and depth weights
+            float spatialWeight = exp(-(distance * distance) / (2.0 * NORMAL_BLUR_SIGMA * NORMAL_BLUR_SIGMA));
+            float weight = spatialWeight * depthWeight;
+            
+            vec3 sampleNormal = sampleNormalWithOffset(pixel, ivec2(x, y), screenSize);
+            
+            blurredNormal += sampleNormal * weight;
+            totalWeight += weight;
+        }
+    }
+    
+    // Normalize both the weight and the vector
+    return normalize(blurredNormal / totalWeight);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 screenSize = imageSize(colorTex);
@@ -71,20 +129,20 @@ void main() {
     vec3 albedo = imageLoad(colorTex, pixel).rgb;
     int materialId = int(imageLoad(materialTex, pixel).r);
     Material material = materials[materialId];
-    vec3 normal = imageLoad(normalsTex, pixel).xyz * 2.0 - 1.0;
+    vec3 normal = blurNormal(pixel, screenSize);  // Using blurred normal
     float depth = imageLoad(depthTex, pixel).r;
     float ao = imageLoad(aoTex, pixel).r;
     float shadow = imageLoad(shadowTex, pixel).r;
 
-
-    vec3 specular = vec3(0.0);
-    float NdotL = 0.0;
-    
     vec3 finalColor;
-    
+    float NdotL;
+    vec3 specular;
+
     if (depth >= 0.9999) {
         finalColor = albedo;
-    } else {
+    }
+    else 
+    {
         // Calculate view direction
         vec4 ndc = vec4(
             (2.0 * pixel.x / float(screenSize.x) - 1.0),
@@ -96,24 +154,19 @@ void main() {
         vec4 worldPos = inverse(projMatrix * viewMatrix) * ndc;
         worldPos /= worldPos.w;
         vec3 viewDir = normalize(cameraPos - worldPos.xyz);
-        
+       
         // Calculate direct diffuse lighting
-        NdotL = clamp(dot(normal, sunDir) + material.transparency, 0.0, 1.0);
+        NdotL = clamp(dot(normal, sunDir), 0.0, 1.0);
     
-        
         // Calculate specular lighting
         float shininess = material.shininess * 100;
         float specularStrength = material.specularStrength * 10;
         vec3 reflectDir = reflect(-sunDir, normal);
         float spec = pow(max(dot(viewDir, reflectDir), 0.0), shininess);
-        specular = specularStrength * spec * sunColor;
-        
-        // Combine all lighting components
-        vec3 directLight = (sunColor + specular) * shadow * NdotL;
-        vec3 indirectLight = ambientColor * ambientStrength * ao;
-        
+        specular = specularStrength * spec * calculateSunColor(sunDir);
+
         // Final color calculation
-        finalColor = albedo * (directLight + indirectLight);
+        finalColor = (albedo + specular) * (shadow + 0.5 / 2.0) * ao;
         
         // Apply tone mapping
         finalColor *= exposure;

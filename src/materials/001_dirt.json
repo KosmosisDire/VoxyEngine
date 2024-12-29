@@ -1,0 +1,45 @@
+{
+    "name": "Dirt",
+    "properties": {
+        "color1": {
+            "r": 0.21,
+            "g": 0.13,
+            "b": 0.09,
+            "controlPoint": 0.0
+        },
+        "color2": {
+            "r": 0.19,
+            "g": 0.11,
+            "b": 0.08,
+            "controlPoint": 0.5
+        },
+        "color3": {
+            "r": 0.23,
+            "g": 0.14,
+            "b": 0.1,
+            "controlPoint": 1.0
+        },
+        "color4": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "noiseSize": 0.5,
+        "noiseStrength": 0.1,
+        "texture1Id": 0,
+        "texture2Id": 0,
+        "textureBlend": 0.0,
+        "blendWithNoise": false,
+        "isPowder": false,
+        "isLiquid": false,
+        "isCollidable": true,
+        "roughness": 0.0,
+        "shininess": 0.1,
+        "specularStrength": 0.05,
+        "reflectivity": 0.0,
+        "transparency": 0.0,
+        "refractiveIndex": 1.0,
+        "emission": 0.0
+    }
+}

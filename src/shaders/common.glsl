@@ -4,8 +4,6 @@ const float PI = 3.14159265359;
 
 // Core Constants
 const float EPSILON = 0.001;
-const int MAX_STEPS = 256;
-const float MAX_DIST = 1000.0;
 
 // Structure Constants
 const int BLOCK_SIZE = 8;      
@@ -18,29 +16,11 @@ const uint BITS_PER_UINT = 32u;
 const uint BITS_PER_ARRAY = 128u;
 const uint UINTS_PER_MASK = 4u;
 
-const int NUM_DIRECTIONS = 26;
-const vec3 NORM_DIRECTIONS[26] = vec3[26](
-    // Must match C# MAIN_DIRECTIONS exactly
-    vec3(1, 0, 0), vec3(-1, 0, 0),
-    vec3(0, 1, 0), vec3(0, -1, 0),
-    vec3(0, 0, 1), vec3(0, 0, -1),
-    
-    normalize(vec3(1, 1, 0)), normalize(vec3(-1, 1, 0)),
-    normalize(vec3(1, -1, 0)), normalize(vec3(-1, -1, 0)),
-    normalize(vec3(1, 0, 1)), normalize(vec3(-1, 0, 1)),
-    normalize(vec3(1, 0, -1)), normalize(vec3(-1, 0, -1)),
-    normalize(vec3(0, 1, 1)), normalize(vec3(0, -1, 1)),
-    normalize(vec3(0, 1, -1)), normalize(vec3(0, -1, -1)),
-    
-    normalize(vec3(1, 1, 1)), normalize(vec3(-1, 1, 1)),
-    normalize(vec3(1, -1, 1)), normalize(vec3(-1, -1, 1)),
-    normalize(vec3(1, 1, -1)), normalize(vec3(-1, 1, -1)),
-    normalize(vec3(1, -1, -1)), normalize(vec3(-1, -1, -1))
-);
+uniform float time;
+
 
 // Material System
-struct Material
-{
+struct Material {
     // gradient colors
     vec4 colors[4];
 
@@ -54,45 +34,55 @@ struct Material
     bool isLiquid;
     bool isCollidable;
 
+    float roughness;
     float shininess;
     float specularStrength;
     float reflectivity;
     float transparency;
     float refractiveIndex;
     float emission;
-
-    float p1;
 };
 
-// Buffer Bindings
+struct Bitmask {
+    uvec4 mask1;
+    uvec4 mask2;
+    uvec4 mask3;
+    uvec4 mask4;
+};
+
+// Buffer Bindings remain the same
 layout(std430, binding = 0) buffer ChunkMasks {
-    uvec4 chunkMasks[];    // 512 bits per chunk for block occupancy (4 uvec4s per block)
+    uvec4 chunkMasks[];
 };
 
 layout(std430, binding = 1) buffer BlockMasks {
-    uvec4 blockMasks[];    // 512 bits per block for voxel occupancy (4 uvec4s per voxel)
+    uvec4 blockMasks[];
 };
 
 layout(std430, binding = 2) buffer MaterialIndices {
-    uint materialIndices[]; // 4 materials per uint
+    uint materialIndices[];
 };
 
 layout(std430, binding = 3) buffer Materials {
-    Material materials[];   // Array of material properties
+    Material materials[];
 };
 
 layout(std430, binding = 4) buffer UncompressedMaterials {
-    uint uncompressedMaterials[];   // 4 materials per uint. One material index per voxel for use during voxel modifications before compression
+    uint uncompressedMaterials[];
 };
 
-// Convert 3D coordinates to local index
+layout(std430, binding = 5) readonly buffer DirectionalBitmasks {
+    uint directionBitmasks[];
+};
+
+// Convert 3D coordinates to local index - corrected order
 int getLocalIndex(ivec3 pos) {
-    return pos.x + pos.z * BLOCK_SIZE + pos.y * BLOCK_SIZE * BLOCK_SIZE;
+    return pos.x + pos.y * BLOCK_SIZE + pos.z * BLOCK_SIZE * BLOCK_SIZE;
 }
 
-// Get chunk index from world position
+// Get chunk index from world position - corrected order
 int getChunkIndex(ivec3 pos) {
-    return pos.x + pos.z * GRID_SIZE + pos.y * GRID_SIZE * GRID_SIZE;
+    return pos.x + pos.y * GRID_SIZE + pos.z * GRID_SIZE * GRID_SIZE;
 }
 
 // Get local position within a chunk/block
@@ -100,9 +90,13 @@ ivec3 getLocalPos(ivec3 pos) {
     return pos % BLOCK_SIZE;
 }
 
-// Get chunk position from chunk index
+// Get chunk position from chunk index - corrected order
 ivec3 getChunkPos(int index) {
-    return ivec3(index % GRID_SIZE, index / (GRID_SIZE * GRID_SIZE), (index / GRID_SIZE) % GRID_SIZE);
+    return ivec3(
+        index % GRID_SIZE,
+        (index / GRID_SIZE) % GRID_SIZE,
+        index / (GRID_SIZE * GRID_SIZE)
+    );
 }
 
 vec3 composePosition(ivec3 chunkPos, ivec3 blockPos, ivec3 voxelPos) {
@@ -144,12 +138,7 @@ void atomicSetBlockBit(int blockIndex, int voxelIndex) {
     atomicOr(blockMasks[arrayIndex][uintIndex], bitMask);
 }
 
-struct Bitmask {
-    uvec4 mask1;
-    uvec4 mask2;
-    uvec4 mask3;
-    uvec4 mask4;
-};
+
 
 // Bit manipulation for masks
 bool getBit(Bitmask mask, int index) {
@@ -330,12 +319,48 @@ float sampleOccupancy(ivec3 pos) {
     return getBit(blockMask, voxelIndex) ? 1.0 : 0.0;
 }
 
+// sample occupancy and return a strngth based on the transparency of the amterial
+float sampleOpaqueOccupancy(ivec3 pos) {
+    if (any(lessThan(pos, ivec3(0))) || any(greaterThanEqual(pos, ivec3(CHUNK_SIZE * GRID_SIZE)))) {
+        return 0.0; // Outside grid is empty
+    }
+    
+    ivec3 chunkPos = pos / CHUNK_SIZE;
+    int chunkIndex = getChunkIndex(chunkPos);
+    Bitmask chunkMask = getChunkBitmask(chunkIndex);
+    
+    if (isEmptyMask(chunkMask)) {
+        return 0.0;
+    }
+    
+    ivec3 blockInChunk = (pos / BLOCK_SIZE) % BLOCK_SIZE;
+    int blockIndex = getLocalIndex(blockInChunk);
+    
+    if (!getBit(chunkMask, blockIndex)) {
+        return 0.0;
+    }
+    
+    int globalBlockIndex = globalIndex(chunkIndex, blockIndex);
+    Bitmask blockMask = getBlockBitmask(globalBlockIndex);
+    ivec3 voxelInBlock = pos % BLOCK_SIZE;
+    int voxelIndex = getLocalIndex(voxelInBlock);
+    
+    if (!getBit(blockMask, voxelIndex)) {
+        return 0.0;
+    }
+    
+    uint materialIndex = getMaterial(voxelIndex);
+    Material material = materials[materialIndex];
+    
+    return material.transparency > 0.0 ? 0.0 : 1.0;
+}
+
 vec3 getPerVoxelNormal(ivec3 cell, int voxelIndex, int blockIndex, Bitmask blockMask) {    
     // For interior voxels, use fast path
     ivec3 localPos = ivec3(
         voxelIndex % BLOCK_SIZE,
-        voxelIndex / (BLOCK_SIZE * BLOCK_SIZE),
-        (voxelIndex / BLOCK_SIZE) % BLOCK_SIZE
+        (voxelIndex / BLOCK_SIZE) % BLOCK_SIZE,
+        voxelIndex / (BLOCK_SIZE * BLOCK_SIZE)
     );
     
     bool nearBoundary = any(lessThan(localPos, ivec3(1))) || 

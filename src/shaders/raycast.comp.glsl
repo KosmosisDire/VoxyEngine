@@ -21,11 +21,11 @@ struct RaycastHit {
 struct RaycastResult {
     vec3 accumulatedColor;
     float opacity;
-    int numHits;
+    int recordedHits;
     int totalSteps;
     bool hasHit;
     int hitCount;
-    RaycastHit hits[MAX_RECORDED_HITS]; 
+    RaycastHit hits[1]; 
 };
 
 struct RaycastInput {
@@ -45,61 +45,54 @@ layout(std430, binding = 10) buffer ResultBuffer {
 
 uniform int rayCount;
 
-// Helper function to convert RaymarchHit to RaycastHit
-RaycastHit convertHit(RaymarchHit hit) {
+// Helper function to convert TraceResult to RaycastHit
+RaycastHit convertHit(TraceResult trace) {
     RaycastHit result;
-    result.position = hit.position;
-    result.normal = hit.normal;
-    result.perVoxNormal = hit.perVoxNormal;
-    result.color = hit.color;
-    result.materialId = hit.materialId;
-    result.distance = hit.dist;
-    result.cellPosition = vec3(hit.cell);
-    result.blockIndex = hit.blockIndex;
-    result.voxelIndex = hit.voxelIndex;
-    result.valid = hit.valid;
+    result.position = trace.position;
+    result.normal = trace.normal;
+    result.perVoxNormal = trace.perVoxNormal;
+    result.color = vec3(0.0); // Placeholder for color, as TraceResult does not include color directly
+    result.materialId = trace.materialId;
+    result.distance = trace.dist;
+    result.cellPosition = vec3(trace.cell);
+    result.valid = trace.hit;
     return result;
 }
 
 void main() {
     uint rayIndex = gl_GlobalInvocationID.x;
     if (rayIndex >= rayCount) return;
-    
+
     // Get ray data
     RaycastInput ray = rays[rayIndex];
-    
+
     // Check basic ray validity
     if (length(ray.direction) < 0.02) {
         return;
     }
-    
-    // Perform raymarch with new accumulator-based system
-    TransparencyAccumulator acc = raymarchMultiLevel(
-        ray.origin, 
-        normalize(ray.direction), 
-        512,
-        ray.maxDistance
-    );
 
-    // Convert accumulator to result structure
+    // Perform single-ray trace
+    TraceResult trace = traceSingleRay(Ray(ray.origin, normalize(ray.direction), ray.maxDistance), 512);
+
+    // Convert trace result to raycast result
     RaycastResult result;
-    result.accumulatedColor = acc.color;
-    result.opacity = acc.opacity;
-    result.numHits = acc.numHits;
-    result.totalSteps = acc.steps;
-    result.hasHit = acc.hasHit;
-    result.hitCount = acc.hitCount;
-    
-    // Convert hits
-    for (int i = 0; i < MAX_RECORDED_HITS; i++) {
-        if (i < acc.numHits) {
-            result.hits[i] = convertHit(acc.hits[i]);
+    result.accumulatedColor = vec3(0.0); // Placeholder, as traceSingleRay does not accumulate color
+    result.opacity = trace.hit ? 1.0 : 0.0;
+    result.recordedHits = trace.hit ? 1 : 0;
+    result.totalSteps = 0; // No direct step tracking available in traceSingleRay
+    result.hasHit = trace.hit;
+    result.hitCount = trace.hit ? 1 : 0;
+
+    // Populate hits array
+    for (int i = 0; i < 1; i++) {
+        if (i == 0 && trace.hit) {
+            result.hits[i] = convertHit(trace);
         } else {
             // Initialize empty hit
             result.hits[i].valid = false;
         }
     }
-    
+
     // Store result
     results[rayIndex] = result;
 }

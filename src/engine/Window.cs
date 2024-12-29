@@ -43,7 +43,7 @@ public class Window
         }
 
         WindowOptions options = WindowOptions.Default;
-        options.Size = new Vector2D<int>(1920, 1080);
+        options.Size = new Vector2D<int>((int)(1920 * 0.8f), (int)(1080 * 0.8f));
         options.Title = "1.2 - Drawing a Quad";
         options.VSync = false;
 

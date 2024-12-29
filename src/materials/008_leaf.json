@@ -1,0 +1,45 @@
+{
+    "name": "Leaf",
+    "properties": {
+        "color1": {
+            "r": 0.12,
+            "g": 0.28,
+            "b": 0.15,
+            "controlPoint": 0.0
+        },
+        "color2": {
+            "r": 0.14,
+            "g": 0.32,
+            "b": 0.17,
+            "controlPoint": 0.3
+        },
+        "color3": {
+            "r": 0.1,
+            "g": 0.25,
+            "b": 0.13,
+            "controlPoint": 0.7
+        },
+        "color4": {
+            "r": 0.11,
+            "g": 0.27,
+            "b": 0.14,
+            "controlPoint": 1.0
+        },
+        "noiseSize": 0.05,
+        "noiseStrength": 0.02,
+        "texture1Id": 0,
+        "texture2Id": 0,
+        "textureBlend": 0.0,
+        "blendWithNoise": false,
+        "isPowder": false,
+        "isLiquid": false,
+        "isCollidable": true,
+        "roughness": 0.0,
+        "shininess": 0.4,
+        "specularStrength": 0.3,
+        "reflectivity": 0.1,
+        "transparency": 0.1,
+        "refractiveIndex": 1.1,
+        "emission": 0.0
+    }
+}

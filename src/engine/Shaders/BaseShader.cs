@@ -251,12 +251,15 @@ public abstract class BaseShader : IDisposable
             }
             else if (value is Vector2D<int> vec2di)
             {
-                var vec = vec2di.As<float>();
-                gl.Uniform2(location, vec.X, vec.Y);
+                gl.Uniform2(location, vec2di.X, vec2di.Y);
             }
             else if (value is Vector3 vec3)
             {
                 gl.Uniform3(location, vec3.X, vec3.Y, vec3.Z);
+            }
+            else if (value is Vector3I vec3i)
+            {
+                gl.Uniform3(location, vec3i.X, vec3i.Y, vec3i.Z);
             }
             else if (value is Vector3D<float> vec3df)
             {
@@ -264,8 +267,7 @@ public abstract class BaseShader : IDisposable
             }
             else if (value is Vector3D<int> vec3di)
             {
-                var vec = vec3di.As<float>();
-                gl.Uniform3(location, vec.X, vec.Y, vec.Z);
+                gl.Uniform3(location, vec3di.X, vec3di.Y, vec3di.Z);
             }
             else if (value is Vector4 vec4)
             {

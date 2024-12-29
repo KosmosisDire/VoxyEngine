@@ -12,16 +12,17 @@ const float noiseScale = 0.3;
 
 bool genSolid(vec3 worldPos)
 {
+    float scale = noiseScale * (snoise(worldPos * noiseScale * 0.1) + 1);
     // height map with 3 levels of noise
-    float h = snoise(vec2(worldPos.x, worldPos.z) * noiseScale * 0.1) * 2;
-    h += snoise(vec2(worldPos.x, worldPos.z) * noiseScale * 0.5) * 0.5;
-    h += snoise(vec2(worldPos.x, worldPos.z) * noiseScale * 0.9) * 0.25;
+    float h = snoise(vec2(worldPos.x, worldPos.z) * scale * 0.1) * 2;
+    h += snoise(vec2(worldPos.x, worldPos.z) * scale * 0.5) * 0.5;
+    h += snoise(vec2(worldPos.x, worldPos.z) * scale * 0.9) * 0.25;
     h = h * 0.5 + 0.5;
-    h *= 1;
+    h *= 2;
     h += 6;
 
     // generate caves
-    float cave = snoise(worldPos * noiseScale);
+    float cave = snoise(worldPos * scale);
     return worldPos.y < h && cave > 0;
 }
 
@@ -51,6 +52,7 @@ uint getMaterialForPosition(vec3 worldPos, bool solidAbove)
         return 3;
     }
 }
+
 
 void main()
 {

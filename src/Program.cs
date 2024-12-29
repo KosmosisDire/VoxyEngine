@@ -5,7 +5,7 @@ using Silk.NET.Input;
 using Silk.NET.OpenGL.Extensions.ImGui;
 
 // Set working directory to find shaders
-Environment.CurrentDirectory = @"C:\Main\Projects\Coding\C#\VoxelRaymarcher\src";
+Environment.CurrentDirectory = @"C:\Main\Projects\Coding\C#\VoxyEngine\src";
 
 // Initialize window and input
 var window = new Window();
@@ -57,7 +57,7 @@ window.OnRender((dt) =>
     ImGui.Text($"Player Position: {player.Position}");
     ImGui.Text($"Grounded: {player.IsGrounded}");
     ImGui.Text($"Step Height: {player.currentStepHeight}");
-    ImGui.Text($"Hovered Material: {Materials.GetMaterialName(voxelRenderer.hoveredCastResult.materialId)}");
+    ImGui.Text($"Hovered Material: {Materials.GetMaterialName((int)voxelRenderer.hoveredCastResult.materialId)}");
     ImGui.Text($"Selected Material: {Materials.GetMaterialName(voxelRenderer.selectedMaterial)}");
     ImGui.Text($"Place Size: {voxelRenderer.placeSize}");
     ImGui.Separator();

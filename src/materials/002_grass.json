@@ -1,0 +1,45 @@
+{
+    "name": "Grass",
+    "properties": {
+        "color1": {
+            "r": 0.21,
+            "g": 0.31,
+            "b": 0.27,
+            "controlPoint": 0.0
+        },
+        "color2": {
+            "r": 0.21,
+            "g": 0.31,
+            "b": 0.27,
+            "controlPoint": 0.3
+        },
+        "color3": {
+            "r": 0.24,
+            "g": 0.35,
+            "b": 0.33,
+            "controlPoint": 1.0
+        },
+        "color4": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "noiseSize": 0.3,
+        "noiseStrength": 0.03,
+        "texture1Id": 0,
+        "texture2Id": 0,
+        "textureBlend": 0.0,
+        "blendWithNoise": false,
+        "isPowder": false,
+        "isLiquid": false,
+        "isCollidable": true,
+        "roughness": 0.1,
+        "shininess": 0.03,
+        "specularStrength": 0.07,
+        "reflectivity": 0.0,
+        "transparency": 0.0,
+        "refractiveIndex": 1.0,
+        "emission": 0.0
+    }
+}

@@ -1,89 +1,55 @@
+#version 460
+
 #include "common.glsl"
 #include "lygia/generative/snoise.glsl"
+#include "atmosphere.glsl"
 
-uniform vec3 sunDir;
-uniform vec3 sunColor;
-
-#define MAX_RECORDED_HITS 2
-#define TRANSPARENT_ACC_RATE 16
-
-// Sky color calculation
-vec3 getSkyColor(vec3 dir) {
-    float sunDot = max(0.0, dot(dir, sunDir));
-    vec3 sun = (pow(sunDot, 48.0) + pow(sunDot, 4.0) * 0.2) * sunColor;
-    
-    float sunHeight = dot(vec3(0,1,0), sunDir);
-    vec3 skyColor = mix(
-        mix(sunColor, vec3(0.6, 0.7, 0.9), sunHeight),
-        vec3(0.2, 0.3, 0.7),
-        dir.y
-    );
-    
-    return sun + skyColor;
-}
-
-struct RaymarchHit {
-    vec3 position;      // Hit position
-    vec3 normal;       // Surface normal at hit
-    vec3 perVoxNormal; // Per-voxel normal
-    vec3 color;        // Material color at hit
-    uint materialId;    // Material ID
-    float dist;        // Distance from ray origin
-    bool valid;        // Whether this hit is valid
-    ivec3 cell;        // Grid cell of the hit
-    int blockIndex;    // Block index for the hit
-    int voxelIndex;    // Voxel index for the hit
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+    float maxDist;
 };
 
-// Add MaterialCache struct to store cached properties
-struct MaterialCache {
-    vec3 color;           // Cached material color
-    float transparency;   // Cached transparency value
-    uint materialId;      // ID of cached material
-    bool valid;          // Whether cache entry is valid
-};
-
-struct TransparencyAccumulator {
-    // Existing fields
+struct ShadingResult
+{
     vec3 color;
-    vec3 normal;
-    float opacity;     
-    RaymarchHit hits[MAX_RECORDED_HITS];
-    int numHits;       
-    uint lastMaterialId;
-    int steps;         
-    bool hasHit;       
-    int hitCount;      
-    
-    // New caching fields
-    MaterialCache currentMaterial;  // Currently active material cache
+    float shadowFactor;
+    float aoFactor;
 };
 
-TransparencyAccumulator initAccumulator() {
-    TransparencyAccumulator acc;
-    // Initialize existing fields
-    acc.color = vec3(0.0);
-    acc.normal = vec3(0.0);
-    acc.opacity = 0.0;
-    acc.numHits = 0;
-    acc.lastMaterialId = 0u;
-    acc.steps = 0;
-    acc.hasHit = false;
-    acc.hitCount = 0;
-    
-    // Initialize material cache
-    acc.currentMaterial.valid = false;
-    acc.currentMaterial.materialId = 0u;
-    
-    // Initialize hits array
-    for (int i = 0; i < MAX_RECORDED_HITS; i++) {
-        acc.hits[i].valid = false;
-    }
-    return acc;
-}
+struct TraceResult {
+    bool hit;
+    float dist;
+    vec3 position;
+    vec3 normal;
+    vec3 perVoxNormal;
+    uint materialId;
+    ivec3 cell;
+    vec3 voxelUV;
+    float shadowFactor;
+    float aoFactor;
+};
+
+struct ShadowResult {
+    bool completelyBlocked;
+    float transmission;
+};
+
+// Used to store final per-pixel results for subsequent post-processing.
+struct PixelResult {
+    vec3 opaqueColor;
+    vec3 transparentColor;
+    vec3 reflectionColor;
+    float shadowFactor;
+    float aoFactor;
+    TraceResult primary;
+    TraceResult reflection;
+    TraceResult transmission;
+};
 
 
-vec3 sampleGradient(Material material, float t) {
+vec3 sampleGradient(Material material, float t)
+{
     // Ensure t is in 0-1 range
     t = clamp(t, 0.0, 1.0);
 
@@ -124,7 +90,7 @@ vec3 sampleGradient(Material material, float t) {
     return mix(prevColor, nextColor, factor);
 }
 
-vec3 getMaterialColor(uint materialId, ivec3 voxelCell) {
+vec3 getMaterialColor(uint materialId, ivec3 voxelCell, vec3 voxelUVs) {
     Material material = materials[materialId];
 
     // Start with base gradient position
@@ -133,8 +99,8 @@ vec3 getMaterialColor(uint materialId, ivec3 voxelCell) {
     // Apply noise if enabled
     if (material.noiseStrength > 0.0) {
         // Calculate noise and normalize to 0-1 range
-        float noise = snoise(vec3(voxelCell) * material.noiseSize);
-        noise = noise * 0.5 + 0.5; // Convert from -1,1 to 0,1 range
+        float noise = (snoise(vec3(voxelCell) * material.noiseSize / 20.0) * 0.5 + 0.5) * 0.5;
+        noise += (snoise(vec3(voxelCell) * material.noiseSize) * 0.5 + 0.5) * 0.5;
         
         // Apply noise strength as a blend between base gradient position and noise
         gradientPos = mix(gradientPos, noise, material.noiseStrength * 30);
@@ -144,121 +110,482 @@ vec3 getMaterialColor(uint materialId, ivec3 voxelCell) {
     return sampleGradient(material, gradientPos);
 }
 
-// Helper function to update material cache
-void updateMaterialCache(inout TransparencyAccumulator acc, uint materialId, ivec3 voxelCell) {
-    // Only update cache if material changes
-    if (!acc.currentMaterial.valid || acc.currentMaterial.materialId != materialId) {
-        Material material = materials[materialId];
-        acc.currentMaterial.color = getMaterialColor(materialId, voxelCell);
-        acc.currentMaterial.transparency = material.transparency;
-        acc.currentMaterial.materialId = materialId;
-        acc.currentMaterial.valid = true;
-    }
+Bitmask bitmaskAnd(Bitmask a, Bitmask b) {
+    return Bitmask(a.mask1 & b.mask1, a.mask2 & b.mask2, a.mask3 & b.mask3, a.mask4 & b.mask4);
 }
 
-// Modified compositeOver function
-void compositeOver(inout TransparencyAccumulator acc, uint materialId, vec3 newNormal, 
-                  vec3 perVoxNormal, float dist, vec3 pos, ivec3 cell, 
-                  int blockIndex, int voxelIndex)
+Bitmask getDirectionMask(vec3 dir, ivec3 pos)
 {
-    // Update material cache if needed
-    updateMaterialCache(acc, materialId, cell);
-    
-    // Use cached values
-    vec3 newColor = acc.currentMaterial.color;
+    int dirIndex  = 0;
+    if (dir.x < 0) dirIndex |= 1;
+    if (dir.y < 0) dirIndex |= 2;
+    if (dir.z < 0) dirIndex |= 4;
 
-    // Record the hit if it's a material transition
-    if (acc.numHits < MAX_RECORDED_HITS && (acc.numHits == 0 || acc.currentMaterial.transparency < EPSILON))
-    {
-        // Create the new hit record
-        RaymarchHit hit;
-        hit.position = pos;
-        hit.normal = newNormal;
-        hit.perVoxNormal = perVoxNormal;
-        hit.color = newColor;
-        hit.materialId = materialId;
-        hit.dist = dist;
-        hit.valid = true;
-        hit.cell = cell;
-        hit.blockIndex = blockIndex;
-        hit.voxelIndex = voxelIndex;
-        
-        // Add the hit to the next available slot
-        acc.hits[acc.numHits] = hit;
-        acc.numHits++;
-        acc.lastMaterialId = materialId;
-    }
-    
-    // Accumulate color using cached values
-    if (acc.hitCount % TRANSPARENT_ACC_RATE == 0 || acc.currentMaterial.transparency < EPSILON)
-    {
-        float alpha = 1.0 - acc.currentMaterial.transparency;
-        float remainingAlpha = 1.0 - acc.opacity;
-        float blendFactor = alpha * remainingAlpha;
-        
-        acc.color += newColor * blendFactor;
-        acc.opacity += blendFactor;
-        acc.hasHit = true;
+    int cellIndex = getLocalIndex(pos);
 
-        if (acc.hitCount == 0)
-        {
-            acc.normal = newNormal;
-        }
-        else if (acc.currentMaterial.transparency < EPSILON || acc.lastMaterialId != materialId)
-        {
-            Material material = materials[acc.currentMaterial.materialId];
-            acc.normal += newNormal * material.specularStrength;
-        }
+    int bitmaskIndex = (cellIndex * 8 + dirIndex) * 16;
 
-        if (acc.currentMaterial.transparency < EPSILON)
-        {
-            acc.normal = normalize(acc.normal);
-        }
-    }
+    Bitmask mask = Bitmask(
+        uvec4(directionBitmasks[bitmaskIndex], directionBitmasks[bitmaskIndex + 1], directionBitmasks[bitmaskIndex + 2], directionBitmasks[bitmaskIndex + 3]),
+        uvec4(directionBitmasks[bitmaskIndex + 4], directionBitmasks[bitmaskIndex + 5], directionBitmasks[bitmaskIndex + 6], directionBitmasks[bitmaskIndex + 7]),
+        uvec4(directionBitmasks[bitmaskIndex + 8], directionBitmasks[bitmaskIndex + 9], directionBitmasks[bitmaskIndex + 10], directionBitmasks[bitmaskIndex + 11]),
+        uvec4(directionBitmasks[bitmaskIndex + 12], directionBitmasks[bitmaskIndex + 13], directionBitmasks[bitmaskIndex + 14], directionBitmasks[bitmaskIndex + 15])
+    );
 
-
-
-    
-    
-    acc.hitCount++;
+    return mask;
 }
 
+bool hasVoxelsInDirection(Bitmask chunkMask, vec3 dir, ivec3 pos)
+{
+    // Get the directional bitmask
+    Bitmask dirMask = getDirectionMask(dir, pos);
+    
+    // AND with the chunk occupancy mask
+    Bitmask result = bitmaskAnd(chunkMask, dirMask);
+    
+    return !isEmptyMask(result);
+}
 
+bool inBounds(ivec3 c) {
+    return all(greaterThanEqual(c,ivec3(EPSILON))) && all(lessThan(c,ivec3(GRID_SIZE)));
+}
 
-TransparencyAccumulator raymarchMultiLevel(vec3 origin, vec3 direction, int maxSteps, float maxDistance = 64.0) {
-    vec3 trueOrigin = origin;
-    vec3 invDir = 1.0 / max(abs(direction), vec3(EPSILON));
-    invDir *= sign(direction);
+vec3[4] getFaceVertices(ivec3 voxelPos, vec3 normal) {
+    vec3[4] vertices;
+    vec3 up, right;
+    
+    // Calculate perpendicular vectors for the face
+    if(abs(normal.x) > 0.99) {
+        up = vec3(0,1,0);
+        right = vec3(0,0,1);
+    } else if(abs(normal.y) > 0.99) {
+        up = vec3(0,0,1);
+        right = vec3(1,0,0);
+    } else {
+        up = vec3(0,1,0);
+        right = vec3(1,0,0);
+    }
+    
+    // Calculate face vertices
+    vec3 basePos = vec3(voxelPos) + normal * 0.5;
+    vertices[0] = basePos - right * 0.5 - up * 0.5; // bottom left
+    vertices[1] = basePos + right * 0.5 - up * 0.5; // bottom right
+    vertices[2] = basePos + right * 0.5 + up * 0.5; // top right
+    vertices[3] = basePos - right * 0.5 + up * 0.5; // top left
+    
+    return vertices;
+}
+
+float cornerOcclusion(ivec3 pos, ivec3 dir1, ivec3 dir2, vec3 uv, int radius)
+{
+    float totalOcclusion = 0.0;
+    float totalWeight = 0.0;
+
+    for (int r1 = 1; r1 <= radius; r1++)
+    {
+        for (int r2 = 1; r2 <= radius; r2++)
+        {
+            // Sample occupancy at the three possible blocks in this corner wedge
+            float occ1 = sampleOpaqueOccupancy(pos + dir1 * r1);
+            float occ2 = sampleOpaqueOccupancy(pos + dir2 * r2);
+            float occ3 = sampleOpaqueOccupancy(pos + dir1 * r1 + dir2 * r2);
+
+            // A simple distance-based falloff for corners that are further out:
+            // (You can also use e.g. 1.0/(r1*r1 + r2*r2) or whatever shape you prefer)
+            float dist = length(vec2(r1, r2));
+            float distWeight = 1.0 / (1.0 + dist * dist);
+
+            //--------------------------------
+            // UV-based corner weighting
+            //--------------------------------
+            // For dir1, pick whichever UV component is relevant;  same for dir2.
+            // E.g. if dir1.x != 0, use uv.x; if dir1.y != 0, use uv.y, etc.
+            // Then we shift by sign(dir1.x) to decide if we want uv or (1-uv).
+            float w1 = 1.0;
+            float w2 = 1.0;
+
+            // Figure out which coordinate to read from uv for dir1
+            if (abs(dir1.x) > 0.5) {
+                w1 = (dir1.x > 0.0) ? uv.x : (1.0 - uv.x);
+            } 
+            else if (abs(dir1.y) > 0.5) {
+                w1 = (dir1.y > 0.0) ? uv.y : (1.0 - uv.y);
+            } 
+            else if (abs(dir1.z) > 0.5) {
+                w1 = (dir1.z > 0.0) ? uv.z : (1.0 - uv.z);
+            }
+
+            // Figure out which coordinate to read from uv for dir2
+            if (abs(dir2.x) > 0.5) {
+                w2 = (dir2.x > 0.0) ? uv.x : (1.0 - uv.x);
+            }
+            else if (abs(dir2.y) > 0.5) {
+                w2 = (dir2.y > 0.0) ? uv.y : (1.0 - uv.y);
+            }
+            else if (abs(dir2.z) > 0.5) {
+                w2 = (dir2.z > 0.0) ? uv.z : (1.0 - uv.z);
+            }
+
+            // Apply a smooth step so that as UV approaches the corner, the weight goes up
+            w1 = smoothstep(0.0, 1.0, w1);
+            w2 = smoothstep(0.0, 1.0, w2);
+
+            // Final corner weighting for this sample
+            float cornerWeight = distWeight * (w1 * w2);
+
+            //--------------------------------
+            // Combine occupancy for these 3 samples
+            //--------------------------------
+            // Weighted sum: you might prefer max(), or average them differently,
+            // depending on how "sharp" you want the corner occlusion to be.
+            float occludedCount = (occ1 + occ2 + occ3 * 0.5);
+
+            // Accumulate
+            totalOcclusion += occludedCount * cornerWeight;
+            totalWeight     += cornerWeight;
+        }
+    }
+
+    // Normalize and invert to get actual AO contribution
+    // (the “*0.33” factor is just a tweak so it’s not too dark)
+    if (totalWeight > 0.0)
+    {
+        return 1.0 - (totalOcclusion / totalWeight) * 0.33;
+    }
+    else
+    {
+        return 1.0;
+    }
+}
+
+float calculateAO(ivec3 voxelPos, vec3 normal, vec3 uv, int radius)
+{
+    // Round normal to figure out which face we’re on
+    ivec3 faceDir = ivec3(round(normal));
+
+    // If normal is diagonal-ish, pick whichever axis is largest in magnitude
+    if (abs(faceDir.x) + abs(faceDir.y) + abs(faceDir.z) != 1)
+    {
+        if (abs(normal.x) > abs(normal.y) && abs(normal.x) > abs(normal.z))
+            faceDir = ivec3(sign(normal.x), 0, 0);
+        else if (abs(normal.y) > abs(normal.x) && abs(normal.y) > abs(normal.z))
+            faceDir = ivec3(0, sign(normal.y), 0);
+        else
+            faceDir = ivec3(0, 0, sign(normal.z));
+    }
+
+    // Pick two side directions perpendicular to faceDir
+    ivec3 side1, side2;
+    if (abs(faceDir.x) == 1)
+    {
+        side1 = ivec3(0, 1, 0);
+        side2 = ivec3(0, 0, 1);
+    }
+    else if (abs(faceDir.y) == 1)
+    {
+        side1 = ivec3(1, 0, 0);
+        side2 = ivec3(0, 0, 1);
+    }
+    else
+    {
+        side1 = ivec3(1, 0, 0);
+        side2 = ivec3(0, 1, 0);
+    }
+
+    // We sample occlusion in each of the 4 corners around this face
+    float aoSum = 0.0;
+    ivec3 basePos = voxelPos + faceDir;  // Just beyond face
+
+    aoSum += cornerOcclusion(basePos,  side1,  side2, uv, radius);
+    aoSum += cornerOcclusion(basePos,  side1, -side2, uv, radius);
+    aoSum += cornerOcclusion(basePos, -side1,  side2, uv, radius);
+    aoSum += cornerOcclusion(basePos, -side1, -side2, uv, radius);
+
+    // Average contributions from all four corners
+    float ao = aoSum * 0.25;
+
+    // Clamp and return
+    return clamp(ao, 0.0, 1.0);
+}
+
+TraceResult traceSingleRay(Ray ray, int maxSteps) {
+    vec3 startPos = ray.origin; 
+
+    TraceResult res;
+    vec3 hitPos = ray.origin + ray.direction * ray.maxDist;
+    res.hit = false;
+    res.dist = ray.maxDist;
+    res.position = hitPos;
+
+    vec3 invDir = 1.0 / max(abs(ray.direction), vec3(EPSILON));
+    invDir *= sign(ray.direction);
 
     float tMin, tMax;
-    TransparencyAccumulator acc = initAccumulator();
-    
-    if (!intersectBox(origin, invDir, vec3(0), vec3(GRID_SIZE), tMin, tMax)) {
-        acc.color = getSkyColor(direction);
-        return acc;
+    if (!intersectBox(ray.origin, invDir, vec3(0), vec3(GRID_SIZE), tMin, tMax))
+    {
+        return res;
     }
 
     if (tMin > 0) {
-        origin += (tMin + EPSILON) * direction;
+        ray.origin += (tMin + EPSILON) * ray.direction;
     }
 
+    int steps=0; 
     vec3 normal;
+
+    if (tMin > 0) {
+        normal = -sign(ray.direction);
+    } else {
+        normal = sign(ray.direction);
+    }
+
+    DDAState chunkDDA = initDDA(ray.origin, ray.direction, invDir);
+    while (steps < maxSteps && isInBounds(chunkDDA.cell, ivec3(GRID_SIZE)))
+    {
+        int cIdx = getChunkIndex(chunkDDA.cell);
+        Bitmask cMask = getChunkBitmask(cIdx);
+
+        if(!isEmptyMask(cMask))
+        {
+            // Block DDA
+            vec3 chunkUV = getDDAUVs(chunkDDA, ray.origin, ray.direction);
+            vec3 blockOrig = clamp(chunkUV * float(BLOCK_SIZE), vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
+            DDAState blockDDA = initDDA(blockOrig, ray.direction, invDir);
+
+            while(steps < maxSteps && isInBounds(blockDDA.cell, ivec3(BLOCK_SIZE)) && hasVoxelsInDirection(cMask, ray.direction, blockDDA.cell))
+            {    
+                int bIdx = getLocalIndex(blockDDA.cell);
+
+                if(getBit(cMask, bIdx))
+                {
+                    // Voxel DDA
+                    int gbIdx = globalIndex(cIdx, bIdx);
+                    Bitmask bMask = getBlockBitmask(gbIdx);
+
+                    if(!isEmptyMask(bMask))
+                    {
+                        vec3 bUV = getDDAUVs(blockDDA, blockOrig, ray.direction);
+                        vec3 voxOrig = clamp(bUV * float(BLOCK_SIZE), vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
+                        DDAState voxDDA = initDDA(voxOrig, ray.direction, invDir);
+
+                        if (hasVoxelsInDirection(bMask, ray.direction, voxDDA.cell))
+                        while(steps < maxSteps && isInBounds(voxDDA.cell, ivec3(BLOCK_SIZE)))
+                        {
+                            int vIdx = getLocalIndex(voxDDA.cell);
+
+                            if(getBit(bMask, vIdx))
+                            {
+                                vec3 voxUV = getDDAUVs(voxDDA, voxOrig, ray.direction);
+                                ivec3 absCell = chunkDDA.cell * CHUNK_SIZE + blockDDA.cell * BLOCK_SIZE + voxDDA.cell;
+                                vec3 hitPos = vec3(absCell + voxUV) / float(CHUNK_SIZE);
+                                float dist = distance(startPos, hitPos);
+
+                                if(dist > ray.maxDist) {
+                                    return res;
+                                }
+
+                                int vgIdx = globalIndex(gbIdx, vIdx);
+                                vec3 perVoxNormal = getPerVoxelNormal(absCell, vIdx, gbIdx, bMask);
+                                uint seed = absCell.x * 17 + absCell.y * 192 + absCell.z * 172;
+                                uint mId = getMaterial(vgIdx);
+                                Material material = materials[mId];
+                                perVoxNormal = normalize(perVoxNormal + vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed)) * material.roughness);
+
+                                res.hit = true;
+                                res.dist = dist;
+                                res.position = hitPos;
+                                res.normal = normal;
+                                res.perVoxNormal = perVoxNormal;
+                                res.materialId = mId;
+                                res.cell = absCell;
+                                res.voxelUV = voxUV;
+
+                                return res;
+                            }
+
+                            normal = stepDDA(voxDDA);
+                            steps++;
+                        }
+                    }
+                }
+
+                normal = stepDDA(blockDDA);
+                steps++;
+            }
+        }
+
+        normal = stepDDA(chunkDDA);
+        steps++;
+    }
+
+    return res;
+}
+
+TraceResult traceSingleRayIgnoreTransparent(Ray ray, int maxSteps) {
+    vec3 startPos = ray.origin; 
+
+    TraceResult res;
+    vec3 hitPos = ray.origin + ray.direction * ray.maxDist;
+    res.hit = false;
+    res.dist = ray.maxDist;
+    res.position = hitPos;
+
+    vec3 invDir = 1.0 / max(abs(ray.direction), vec3(EPSILON));
+    invDir *= sign(ray.direction);
+
+    float tMin, tMax;
+    if (!intersectBox(ray.origin, invDir, vec3(0), vec3(GRID_SIZE), tMin, tMax))
+    {
+        return res;
+    }
+
+    if (tMin > 0) {
+        ray.origin += (tMin + EPSILON) * ray.direction;
+    }
+
+    int steps = 0; 
+    vec3 normal;
+
+    if (tMin > 0) {
+        normal = -sign(ray.direction);
+    } else {
+        normal = sign(ray.direction);
+    }
+
+    DDAState chunkDDA = initDDA(ray.origin, ray.direction, invDir);
+    while (steps < maxSteps && isInBounds(chunkDDA.cell, ivec3(GRID_SIZE)))
+    {
+        int cIdx = getChunkIndex(chunkDDA.cell);
+        Bitmask cMask = getChunkBitmask(cIdx);
+
+        if(!isEmptyMask(cMask))
+        {
+            // Block DDA
+            vec3 chunkUV = getDDAUVs(chunkDDA, ray.origin, ray.direction);
+            vec3 blockOrig = clamp(chunkUV * float(BLOCK_SIZE), vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
+            DDAState blockDDA = initDDA(blockOrig, ray.direction, invDir);
+
+            while(steps < maxSteps && isInBounds(blockDDA.cell, ivec3(BLOCK_SIZE)) && hasVoxelsInDirection(cMask, ray.direction, blockDDA.cell))
+            {    
+                int bIdx = getLocalIndex(blockDDA.cell);
+
+                if(getBit(cMask, bIdx))
+                {
+                    // Voxel DDA
+                    int gbIdx = globalIndex(cIdx, bIdx);
+                    Bitmask bMask = getBlockBitmask(gbIdx);
+
+                    if(!isEmptyMask(bMask))
+                    {
+                        vec3 bUV = getDDAUVs(blockDDA, blockOrig, ray.direction);
+                        vec3 voxOrig = clamp(bUV * float(BLOCK_SIZE), vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
+                        DDAState voxDDA = initDDA(voxOrig, ray.direction, invDir);
+
+                        if (hasVoxelsInDirection(bMask, ray.direction, voxDDA.cell))
+                        while(steps < maxSteps && isInBounds(voxDDA.cell, ivec3(BLOCK_SIZE)))
+                        {
+                            int vIdx = getLocalIndex(voxDDA.cell);
+
+                            if(getBit(bMask, vIdx))
+                            {
+                                int vgIdx = globalIndex(gbIdx, vIdx);
+                                uint mId = getMaterial(vgIdx);
+                                
+                                // Check if material is transparent - if so, continue traversal
+                                Material material = materials[mId];
+                                if (material.transparency > EPSILON) {
+                                    normal = stepDDA(voxDDA);
+                                    steps++;
+                                    continue;
+                                }
+
+                                vec3 voxUV = getDDAUVs(voxDDA, voxOrig, ray.direction);
+                                ivec3 absCell = chunkDDA.cell * CHUNK_SIZE + blockDDA.cell * BLOCK_SIZE + voxDDA.cell;
+                                vec3 hitPos = vec3(absCell + voxUV) / float(CHUNK_SIZE);
+                                float dist = distance(startPos, hitPos);
+
+                                if(dist > ray.maxDist) {
+                                    return res;
+                                }
+
+                                vec3 perVoxNormal = getPerVoxelNormal(absCell, vIdx, gbIdx, bMask);
+                                uint seed = absCell.x * 17 + absCell.y * 192 + absCell.z * 172;
+                                perVoxNormal = normalize(perVoxNormal + vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed)) * material.roughness);
+
+                                res.hit = true;
+                                res.dist = dist;
+                                res.position = hitPos;
+                                res.normal = normal;
+                                res.perVoxNormal = perVoxNormal;
+                                res.materialId = mId;
+                                res.cell = absCell;
+                                res.voxelUV = voxUV;
+
+                                return res;
+                            }
+
+                            normal = stepDDA(voxDDA);
+                            steps++;
+                        }
+                    }
+                }
+
+                normal = stepDDA(blockDDA);
+                steps++;
+            }
+        }
+
+        normal = stepDDA(chunkDDA);
+        steps++;
+    }
+
+    return res;
+}
+
+ShadowResult traceShadowRay(Ray ray, int maxSteps) {
+    vec3 startPos = ray.origin;
     
-    // Start at chunk level
-    DDAState chunkDDA = initDDA(origin, direction, invDir);
-    while (acc.steps < maxSteps && isInBounds(chunkDDA.cell, ivec3(GRID_SIZE))) {
+    // Initialize shadow result
+    ShadowResult res;
+    res.completelyBlocked = false;
+    res.transmission = 1.0;
+
+    vec3 invDir = 1.0 / max(abs(ray.direction), vec3(EPSILON));
+    invDir *= sign(ray.direction);
+
+    float tMin, tMax;
+    if (!intersectBox(ray.origin, invDir, vec3(0), vec3(GRID_SIZE), tMin, tMax)) {
+        return res;
+    }
+
+    if (tMin > 0) {
+        ray.origin += (tMin + EPSILON) * ray.direction;
+    }
+
+    int steps = 0;
+    vec3 normal;
+
+    // Calculate initial normal based on entry point
+    if (tMin > 0) {
+        normal = -sign(ray.direction);
+    } else {
+        normal = sign(ray.direction);
+    }
+
+    // Chunk level traversal
+    DDAState chunkDDA = initDDA(ray.origin, ray.direction, invDir);
+    while (steps < maxSteps && isInBounds(chunkDDA.cell, ivec3(GRID_SIZE))) {
         int chunkIndex = getChunkIndex(chunkDDA.cell);
         Bitmask chunkMask = getChunkBitmask(chunkIndex);
 
         if (!isEmptyMask(chunkMask)) {
-            vec3 chunkUVs = getDDAUVs(chunkDDA, origin, direction);
-            
             // Block traversal
-            vec3 blockOrigin = chunkUVs * float(BLOCK_SIZE);
-            blockOrigin = clamp(blockOrigin, vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
-            DDAState blockDDA = initDDA(blockOrigin, direction, invDir);
+            vec3 chunkUVs = getDDAUVs(chunkDDA, ray.origin, ray.direction);
+            vec3 blockOrigin = clamp(chunkUVs * float(BLOCK_SIZE), vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
+            DDAState blockDDA = initDDA(blockOrigin, ray.direction, invDir);
 
-            while (acc.steps < maxSteps && isInBounds(blockDDA.cell, ivec3(BLOCK_SIZE))) {
+            while (steps < maxSteps && isInBounds(blockDDA.cell, ivec3(BLOCK_SIZE)) && 
+                   hasVoxelsInDirection(chunkMask, ray.direction, blockDDA.cell)) {
                 int blockLocalIndex = getLocalIndex(blockDDA.cell);
 
                 if (getBit(chunkMask, blockLocalIndex)) {
@@ -266,80 +593,209 @@ TransparencyAccumulator raymarchMultiLevel(vec3 origin, vec3 direction, int maxS
                     Bitmask blockMask = getBlockBitmask(blockIndex);
 
                     if (!isEmptyMask(blockMask)) {
-                        vec3 blockUVs = getDDAUVs(blockDDA, blockOrigin, direction);
-                        
-                        // Voxel traversal
-                        vec3 voxelOrigin = blockUVs * float(BLOCK_SIZE);
-                        voxelOrigin = clamp(voxelOrigin, vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
-                        DDAState voxelDDA = initDDA(voxelOrigin, direction, invDir);
+                        vec3 blockUVs = getDDAUVs(blockDDA, blockOrigin, ray.direction);
+                        vec3 voxelOrigin = clamp(blockUVs * float(BLOCK_SIZE), vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
+                        DDAState voxelDDA = initDDA(voxelOrigin, ray.direction, invDir);
 
-                        while (acc.steps < maxSteps && isInBounds(voxelDDA.cell, ivec3(BLOCK_SIZE))) {
+                        while (steps < maxSteps && isInBounds(voxelDDA.cell, ivec3(BLOCK_SIZE)) && 
+                               hasVoxelsInDirection(blockMask, ray.direction, voxelDDA.cell)) {
                             int voxelLocalIndex = getLocalIndex(voxelDDA.cell);
 
                             if (getBit(blockMask, voxelLocalIndex)) {
-                                vec3 voxelUVs = getDDAUVs(voxelDDA, voxelOrigin, direction);
+                                vec3 voxelUVs = getDDAUVs(voxelDDA, voxelOrigin, ray.direction);
                                 ivec3 absoluteCell = chunkDDA.cell * CHUNK_SIZE + 
                                                    blockDDA.cell * BLOCK_SIZE + 
                                                    voxelDDA.cell;
                                 vec3 hitPos = vec3(absoluteCell + voxelUVs) / float(CHUNK_SIZE);
-                                float dist = distance(trueOrigin, hitPos);
+                                float dist = distance(startPos, hitPos);
 
-                                if (dist > maxDistance) {
-                                    return acc;
+                                if (dist > ray.maxDist) {
+                                    return res;
                                 }
 
-                                vec3 voxelNormal = getPerVoxelNormal(absoluteCell, voxelLocalIndex, 
-                                                                    blockIndex, blockMask);
-                                vec3 finalNormal = normal;
-                                if (voxelNormal != vec3(0)) {
-                                    finalNormal = voxelNormal;
-                                }
-
+                                // Get material and check transparency
                                 int voxelGlobalIndex = globalIndex(blockIndex, voxelLocalIndex);
                                 uint materialId = getMaterial(voxelGlobalIndex);
+                                Material material = materials[materialId];
+                                float alpha = 1.0 - material.transparency;
 
-                                // Use optimized compositeOver with material caching
-                                compositeOver(acc, materialId, finalNormal, voxelNormal, 
-                                           dist, hitPos, absoluteCell, 
-                                           blockIndex, voxelLocalIndex);
-
-                                // Early exit if fully opaque
-                                if (acc.opacity > 0.99) {
-                                    return acc;
+                                // Handle opaque case - early exit
+                                if (alpha > 0.99) {
+                                    res.completelyBlocked = true;
+                                    res.transmission = 0.0;
+                                    return res;
                                 }
 
-                                // Continue if transparent (using cached transparency)
-                                if (acc.currentMaterial.transparency > EPSILON) {
-                                    normal = stepDDA(voxelDDA);
-                                    acc.steps++;
-                                    continue;
+                                // Handle transparent case
+                                res.transmission *= material.transparency;
+                                if (res.transmission < 0.001) {
+                                    return res;
                                 }
-
-                                return acc;
                             }
 
                             normal = stepDDA(voxelDDA);
-                            acc.steps++;
+                            steps++;
                         }
                     }
                 }
 
                 normal = stepDDA(blockDDA);
-                acc.steps++;
+                steps++;
             }
         }
 
         normal = stepDDA(chunkDDA);
-        acc.steps++;
+        steps++;
     }
 
-    // Blend with sky for partial transparency or complete misses
-    if (acc.hasHit) {
-        vec3 skyColor = getSkyColor(direction);
-        acc.color = acc.color + (1.0 - acc.opacity) * skyColor;
-    } else {
-        acc.color = getSkyColor(direction);
+    return res;
+}
+
+ShadingResult shadingFromTraceResult(TraceResult primary, Material mat, vec3 normal, vec3 perVoxNormal, vec3 nextRayOrigin, float maxDist)
+{
+    ShadingResult shading;
+    shading.color = vec3(0);
+    shading.shadowFactor = 1.0;
+    shading.aoFactor = 1.0;
+
+
+    vec3 baseColor = getMaterialColor(primary.materialId, primary.cell, vec3(0.5));
+
+    float ndl = max(dot(perVoxNormal, sunDir), mat.transparency);
+    ShadowResult sRes = traceShadowRay(Ray(nextRayOrigin, sunDir, maxDist), 512);
+
+    shading.color = baseColor;
+    shading.shadowFactor = (sRes.transmission) * ndl;
+    shading.aoFactor = calculateAO(primary.cell, normal, primary.voxelUV, 2);
+
+    return shading;
+}
+
+
+PixelResult tracePixel(vec3 camOrigin, vec3 camDirection, int maxSteps, float maxDist) 
+{
+    PixelResult px;
+    px.opaqueColor = vec3(0);
+    px.transparentColor = vec3(0);
+    px.reflectionColor = vec3(0);
+    px.shadowFactor = 1.0;
+    px.aoFactor = 1.0;
+    px.transmission.shadowFactor = 1.0;
+    px.transmission.aoFactor = 1.0;
+    px.reflection.shadowFactor = 1.0;
+    px.reflection.aoFactor = 1.0;
+    px.primary.shadowFactor = 1.0;
+    px.primary.aoFactor = 1.0;
+    px.transmission.perVoxNormal = vec3(0);
+    px.reflection.perVoxNormal = vec3(0);
+    px.primary.perVoxNormal = vec3(0);
+    px.transmission.normal = vec3(0);
+    px.reflection.normal = vec3(0);
+    px.primary.normal = vec3(0);
+
+    camDirection = normalize(camDirection);
+    Ray primaryRay = Ray(camOrigin, camDirection, maxDist);
+    TraceResult primary = traceSingleRay(primaryRay, maxSteps);
+    primary.shadowFactor = 1.0;
+    primary.aoFactor = 1.0;
+
+
+    if(!primary.hit)
+    {
+        px.primary = primary;
+        return px;
     }
+
+    vec3 normal = primary.normal;
+    vec3 perVoxNormal = primary.perVoxNormal;
+    vec3 nextRayOrigin = primary.position + 0.001 * normal;
+    Material mat = materials[primary.materialId];
+
+    // Shading
+    ShadingResult shading = shadingFromTraceResult(primary, mat, normal, perVoxNormal, nextRayOrigin, maxDist);
+
+    primary.shadowFactor = shading.shadowFactor;
+    primary.aoFactor = shading.aoFactor;
+
+    px.opaqueColor = shading.color;
+    px.shadowFactor = shading.shadowFactor;
+    px.aoFactor = shading.aoFactor;
+
+    // Reflection
+    if(mat.reflectivity > EPSILON)
+    {
+        Ray refl;
+        refl.origin = nextRayOrigin;
+        refl.direction = reflect(primaryRay.direction, primary.perVoxNormal);
+        refl.maxDist = maxDist;
+
+        TraceResult reflTrace = traceSingleRayIgnoreTransparent(refl, maxSteps);
+
+        if(reflTrace.hit)
+        {
+            vec3 reflNormal = reflTrace.normal;
+            vec3 reflPerVoxNormal = reflTrace.perVoxNormal;
+            vec3 reflNextRayOrigin = reflTrace.position + 0.001 * reflNormal;
+            Material reflMat = materials[reflTrace.materialId];
+
+            ShadingResult reflShading = shadingFromTraceResult(reflTrace, reflMat, reflNormal, reflPerVoxNormal, reflNextRayOrigin, maxDist);
+
+            reflTrace.shadowFactor = reflShading.shadowFactor;
+            reflTrace.aoFactor = reflShading.aoFactor;
+
+            px.reflectionColor = reflShading.color;
+            px.shadowFactor *= reflShading.shadowFactor;
+            px.aoFactor *= reflShading.aoFactor;
+        }
+        else
+        {
+            px.reflectionColor = getSkyColor(refl.direction);
+            reflTrace.shadowFactor = 1.0;
+            reflTrace.aoFactor = 1.0;
+        }
+
+        px.reflection = reflTrace;
+    }
+
+    px.shadowFactor = max(px.shadowFactor, mat.transparency);
+
+    // Refraction / transparency pass
+    if(mat.transparency > EPSILON) {
+        Ray refr;
+        refr.origin = nextRayOrigin;
+        refr.direction = primaryRay.direction;
+        refr.maxDist = maxDist;
+
+        TraceResult refrTrace = traceSingleRayIgnoreTransparent(refr, maxSteps);
+        if(refrTrace.hit)
+        {
+            // Shading
+            vec3 refrNormal = refrTrace.normal;
+            vec3 refrPerVoxNormal = refrTrace.perVoxNormal;
+            vec3 refrNextRayOrigin = refrTrace.position + 0.001 * refrNormal;
+            Material refrMat = materials[refrTrace.materialId];
+
+            ShadingResult refrShading = shadingFromTraceResult(refrTrace, refrMat, refrNormal, refrPerVoxNormal, refrNextRayOrigin, maxDist);
+
+            refrTrace.shadowFactor = refrShading.shadowFactor;
+            refrTrace.aoFactor = refrShading.aoFactor;
+
+            px.transparentColor = refrShading.color;
+            px.shadowFactor *= refrShading.shadowFactor;
+            px.aoFactor *= refrShading.aoFactor;
+        }
+        else
+        {
+            px.transparentColor = getSkyColor(refr.direction);
+            refrTrace.shadowFactor = 1.0;
+            refrTrace.aoFactor = 1.0;
+        }
+
+        px.transmission = refrTrace;
+    }
+
+    px.shadowFactor = clamp(px.shadowFactor, 0.0, 1.0);
+    px.primary = primary;
     
-    return acc;
+    return px;
 }

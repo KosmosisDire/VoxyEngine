@@ -117,6 +117,34 @@ void atomicClearVoxel(ivec3 pos) {
     atomicAnd(blockMasks[blockIndices.arrayIndex][blockIndices.uintIndex], blockBit);
 }
 
+void atomicSetVoxel(ivec3 pos, uint materialId) {
+    if (!isValidPosition(pos)) {
+        return;
+    }
+    
+    // Calculate all indices at once
+    ivec3 chunkPos = pos / CHUNK_SIZE;
+    int chunkIndex = getChunkIndex(chunkPos);
+    ivec3 blockInChunk = (pos / BLOCK_SIZE) & (BLOCK_SIZE - 1);
+    int blockIndex = getLocalIndex(blockInChunk);
+    int globalBlockIndex = chunkIndex * (BLOCK_SIZE * BLOCK_SIZE * BLOCK_SIZE) + blockIndex;
+    ivec3 voxelInBlock = pos & (BLOCK_SIZE - 1);
+    int voxelIndex = getLocalIndex(voxelInBlock);
+    
+    // Set material
+    setMaterial(globalIndex(globalBlockIndex, voxelIndex), materialId);
+
+    // Set block bit
+    BitIndices blockIndices = calculateBitIndices(globalBlockIndex * 4, voxelIndex);
+    uint blockBit = 1u << blockIndices.bitIndex;
+    atomicOr(blockMasks[blockIndices.arrayIndex][blockIndices.uintIndex], blockBit);
+
+    // Set chunk bit
+    BitIndices chunkIndices = calculateBitIndices(chunkIndex * 4, blockIndex);
+    uint chunkBit = 1u << chunkIndices.bitIndex;
+    atomicOr(chunkMasks[chunkIndices.arrayIndex][chunkIndices.uintIndex], chunkBit);
+}
+
 bool atomicMoveVoxel(ivec3 fromPos, ivec3 toPos) {
     if (!isValidPosition(toPos)) {
         return false;
@@ -159,9 +187,6 @@ bool atomicMoveVoxel(ivec3 fromPos, ivec3 toPos) {
     // Clear the source material and occupancy
     setMaterial(fromGlobalVoxelIndex, 0); // Set source to empty material
     atomicClearVoxel(fromPos);
-    
-    // Memory barrier to ensure operations complete in order
-    memoryBarrier();
     
     return true;
 }

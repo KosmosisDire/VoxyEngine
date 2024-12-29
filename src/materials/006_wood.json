@@ -1,0 +1,45 @@
+{
+    "name": "Wood",
+    "properties": {
+        "color1": {
+            "r": 0.54,
+            "g": 0.44,
+            "b": 0.32,
+            "controlPoint": 0.0
+        },
+        "color2": {
+            "r": 0.32,
+            "g": 0.18,
+            "b": 0.1,
+            "controlPoint": -0.5
+        },
+        "color3": {
+            "r": 0.38,
+            "g": 0.22,
+            "b": 0.14,
+            "controlPoint": -1.0
+        },
+        "color4": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "noiseSize": 0.5,
+        "noiseStrength": 0.02,
+        "texture1Id": 0,
+        "texture2Id": 0,
+        "textureBlend": 0.0,
+        "blendWithNoise": false,
+        "isPowder": false,
+        "isLiquid": false,
+        "isCollidable": true,
+        "roughness": 0.1,
+        "shininess": 0.3,
+        "specularStrength": 0.6,
+        "reflectivity": 0.0,
+        "transparency": 0.0,
+        "refractiveIndex": 1.0,
+        "emission": 0.0
+    }
+}

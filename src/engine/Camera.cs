@@ -35,6 +35,9 @@ public class Camera
     public float Near {get; set;} = 0.01f;
     public float Far {get; set;} = 500f;
 
+    public float FovY => FieldOfView / AspectRatio;
+    public float FovX => FieldOfView;
+
     public Matrix4x4 ViewMatrix = Matrix4x4.Identity;
     public Matrix4x4 PerspectiveMatrix = Matrix4x4.Identity;
     public Matrix4x4 ViewProjectionMatrix = Matrix4x4.Identity;

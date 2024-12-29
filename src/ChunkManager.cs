@@ -20,7 +20,7 @@ public class ChunkManager
     public const uint GridSize = 25;             // 50x50x50 chunks
     public const uint NumChunks = GridSize * GridSize * GridSize;
     public const uint SplitNodeCount = ChunkSize * ChunkSize * ChunkSize;
-    public const uint MaskUintsNeeded = 16;
+    public const uint MaskUintsNeeded = (SplitNodeCount + 31) / 32;
     public const uint BytesPerMask = MaskUintsNeeded * sizeof(uint);
 
     ComputeShader buildShader;
@@ -28,9 +28,8 @@ public class ChunkManager
     public ChunkManager()
     {
         this.Origin = Vector3.Zero;
+        Materials.Initialize();
     }
-
-
 
     public unsafe void CreateBuffers(GLContext ctx)
     {
@@ -57,20 +56,32 @@ public class ChunkManager
             Array.Fill(initialIndices, uint.MaxValue);
             gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(NumChunks * SplitNodeCount * sizeof(uint)), [.. initialIndices], BufferUsageARB.DynamicDraw);
 
-            // Create and initialize materials buffer
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, materialData);
             gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(256 * sizeof(Material)), [.. Materials.materials], BufferUsageARB.StaticDraw);
-            // give materials buffer a debug name
             gl.ObjectLabel(ObjectIdentifier.Buffer, materialData, (uint)Materials.materials.Length, "Material Data");
+
+            // re-upload material data on reload
+            Materials.OnMaterialsReloaded += () =>
+            {
+                ctx.ExecuteCmd((dt, gl) =>
+                {
+                    Console.WriteLine("Uploading material data");
+                    gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, materialData);
+                    gl.BufferSubData(BufferTargetARB.ShaderStorageBuffer, 0, (nuint)(256 * sizeof(Material)), [.. Materials.materials]);
+                    gl.ObjectLabel(ObjectIdentifier.Buffer, materialData, (uint)Materials.materials.Length, "Material Data");
+                });
+            };
 
             // Uncompressed materials buffer. One byte per voxel representing the material index
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, uncompressedMaterials);
             gl.BufferData(BufferTargetARB.ShaderStorageBuffer, (nuint)(NumChunks * SplitNodeCount * SplitNodeCount), null, BufferUsageARB.DynamicDraw);
 
+
+
             gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, 0);
         });
 
-        buildShader = new ComputeShader(ctx, "shaders/build-tree.comp.glsl");
+        buildShader = new ComputeShader(ctx, "shaders/terrain-gen.comp.glsl");
     }
 
     public unsafe void BindBuffers(GL gl)
@@ -95,6 +106,16 @@ public class ChunkManager
 
             chunkCount += numChunks;
         });
+    }
+
+    public void GenerateAllTerrainCPU(GLContext ctx)
+    {
+        var generator = new TerrainGenerator();
+        ctx.ExecuteCmd((dt, gl) =>
+        {
+            generator.GenerateAllTerrain(gl, chunkMasks, blockMasks, uncompressedMaterials);
+        });
+        chunkCount = (int)(GridSize * GridSize * GridSize);
     }
 
     public unsafe void Dispose(GL gl)

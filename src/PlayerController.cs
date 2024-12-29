@@ -4,16 +4,26 @@ using Silk.NET.Input;
 
 public class PlayerController
 {
+    // Movement and physics parameters
     public Vector3 physicsVelocity;
     public Vector3 movementVelocity;
     public Vector3 lastMoveDirection;
-    public float jumpImpulse = 4f;
-    public float acceleration = 5f;
-    public float runAcceleration = 8f;
-    public float deceleration = 10f;
-    public float walkSpeed = 1.25f;
-    public float runSpeed = 3.0f;
+    public float jumpImpulse = 2f;
+    public float acceleration = 8f;
+    public float runAcceleration = 10f;
+    public float deceleration = 20f;
+    public float walkSpeed = 0.7f;
+    public float runSpeed = 1.5f;
     public float heightLerpSpeed = 25f;
+
+    // Flying parameters
+    public bool isFlying = true;
+    public float flySpeed = 3.0f;
+    public float flyVerticalSpeed = 2.0f;
+    public float flyAcceleration = 6f;
+    private const float doubleTapWindow = 0.3f;
+    private float[] lastSpacePresses = new float[2] { -1f, -1f };
+    private float currentTime = 0f;
 
     // Crouch parameters
     public float crouchSpeedMultiplier = 0.3f;
@@ -30,16 +40,17 @@ public class PlayerController
     private bool wasGrounded = false;
 
     // Step height parameters
-    public float maxStepHeight = 0.08f; // Maximum height of step that can be climbed
+    public float maxStepHeight = 0.08f;
     private bool isStepTooHigh = false;
     public float currentStepHeight = 0f;
 
+    // World and state parameters
     protected VoxelRenderer voxelWorld;
     public bool IsGrounded { get; private set; } = false;
     
     public RaycastHit groundHit;
     public RaycastHit frontHit;
-    public float playerHeight = 0.25f;
+    public float playerHeight = (1/64f) * 2.5f * 2.5f;
     
     private Vector3 position;
     public Vector3 Position 
@@ -54,8 +65,20 @@ public class PlayerController
     protected IKeyboard Keyboard;
     protected IMouse Mouse;
 
-    // freeze for a time so the world can load 
     public float freezeTime = 2.0f;
+
+    private bool IsDoubleTap()
+    {
+        if (lastSpacePresses[1] < 0) return false;
+        return (currentTime - lastSpacePresses[1]) <= doubleTapWindow && 
+               (lastSpacePresses[1] - lastSpacePresses[0]) <= doubleTapWindow;
+    }
+
+    private void UpdateSpacePress()
+    {
+        lastSpacePresses[0] = lastSpacePresses[1];
+        lastSpacePresses[1] = currentTime;
+    }
 
     public PlayerController(IKeyboard keyboard, IMouse mouse, Vector3 position, Vector3? cameraRotation = null)
     {
@@ -72,27 +95,45 @@ public class PlayerController
 
         Keyboard.KeyDown += (board, key, arg3) =>
         {
-            if (key == Key.Space && !isCrouching)
+            if (key == Key.Space)
             {
-                if (IsGrounded || coyoteTimer > 0)
+                if (!isCrouching)
                 {
-                    physicsVelocity.Y = jumpImpulse;
-                    hasJumped = true;
-                    coyoteTimer = 0;
-                    jumpBufferTimer = 0;
-                }
-                else
-                {
-                    jumpBufferTimer = jumpBufferSeconds;
+                    // Handle regular jump
+                    if (IsGrounded || coyoteTimer > 0)
+                    {
+                        physicsVelocity.Y = jumpImpulse;
+                        hasJumped = true;
+                        coyoteTimer = 0;
+                        jumpBufferTimer = 0;
+                    }
+                    else if (!IsGrounded)
+                    {
+                        jumpBufferTimer = jumpBufferSeconds;
+                    }
+
+                    // Update space press timing and check for double tap
+                    UpdateSpacePress();
+                    if (IsDoubleTap())
+                    {
+                        isFlying = !isFlying;
+                        if (isFlying)
+                        {
+                            physicsVelocity = Vector3.Zero;
+                        }
+                    }
                 }
             }
         };
 
         Keyboard.KeyUp += (board, key, arg3) =>
         {
-            if (key == Key.Space && physicsVelocity.Y > 0)
+            if (key == Key.Space)
             {
-                physicsVelocity.Y /= 2;
+                if (!isFlying && physicsVelocity.Y > 0)
+                {
+                    physicsVelocity.Y /= 2;
+                }
             }
         };
     }
@@ -105,6 +146,8 @@ public class PlayerController
     public void Update(double deltaTime)
     {
         float dt = (float)deltaTime;
+        currentTime += dt;
+        
         if (voxelWorld == null) throw new System.Exception("PlayerController requires a VoxelRenderer to be set");
 
         if (freezeTime > 0)
@@ -112,14 +155,28 @@ public class PlayerController
             freezeTime -= dt;
             return;
         }
-        
+
         // Update timers
         if (coyoteTimer > 0) coyoteTimer = Math.Max(0, coyoteTimer - dt);
         if (jumpBufferTimer > 0) jumpBufferTimer = Math.Max(0, jumpBufferTimer - dt);
-        
-        // Update physics first
-        physicsVelocity += Vector3.UnitY * -6.8f * dt;
-        
+
+        // Handle flying physics
+        if (isFlying)
+        {
+            physicsVelocity = Vector3.Zero; // No gravity in flying mode
+            
+            // Vertical movement while flying
+            if (Keyboard.IsKeyPressed(Key.Space))
+                physicsVelocity.Y = flyVerticalSpeed;
+            else if (Keyboard.IsKeyPressed(Key.ShiftLeft))
+                physicsVelocity.Y = -flyVerticalSpeed;
+        }
+        else
+        {
+            // Normal physics with gravity
+            physicsVelocity += Vector3.UnitY * -6.8f * dt;
+        }
+
         // Ground check at new position
         var randomVariation = new Vector3(Random.Shared.NextSingle() * 0.0001f);
         var groundCast = new RaycastInput(Position, -Vector3.UnitY + randomVariation, playerHeight - physicsVelocity.Y * dt);
@@ -145,10 +202,12 @@ public class PlayerController
 
         if (IsGrounded)
         {
-            Position = Position with {Y = groundHit.position.Y + playerHeight};
-            physicsVelocity.Y = Math.Max(0, physicsVelocity.Y);
+            Position = Position with { Y = groundHit.position.Y + playerHeight };
+            if (!isFlying) // Only zero out Y velocity if not flying
+            {
+                physicsVelocity.Y = Math.Max(0, physicsVelocity.Y);
+            }
 
-            // Handle jump buffer when landing
             if (jumpBufferTimer > 0 && !isCrouching)
             {
                 physicsVelocity.Y = jumpImpulse;
@@ -165,7 +224,7 @@ public class PlayerController
         Camera.HandleLook(deltaTime);
 
         // Update crouch state
-        isCrouching = Keyboard.IsKeyPressed(Key.ShiftLeft);
+        isCrouching = Keyboard.IsKeyPressed(Key.ShiftLeft) && !isFlying;
 
         // Handle movement input relative to camera orientation
         var forward = Vector3.Normalize(Camera.Forward with { Y = 0 });
@@ -173,17 +232,29 @@ public class PlayerController
 
         Vector3 moveForce = Vector3.Zero;
         
-        bool isRunning = Keyboard.IsKeyPressed(Key.ControlLeft) && !isCrouching;
-        
-        float currentAcceleration = isRunning ? runAcceleration : acceleration;
-        float currentMaxSpeed = isRunning ? runSpeed : walkSpeed;
+        float currentAcceleration;
+        float currentMaxSpeed;
 
-        if (isCrouching)
+        bool isRunning = Keyboard.IsKeyPressed(Key.ControlLeft) && !isCrouching;
+
+        if (isFlying)
         {
-            currentAcceleration *= crouchSpeedMultiplier;
-            currentMaxSpeed *= crouchSpeedMultiplier;
+            currentAcceleration = flyAcceleration;
+            currentMaxSpeed = isRunning ? flySpeed * (runSpeed / walkSpeed) : flySpeed;
+        }
+        else
+        {
+            currentAcceleration = isRunning ? runAcceleration : acceleration;
+            currentMaxSpeed = isRunning ? runSpeed : walkSpeed;
+
+            if (isCrouching)
+            {
+                currentAcceleration *= crouchSpeedMultiplier;
+                currentMaxSpeed *= crouchSpeedMultiplier;
+            }
         }
 
+        // Movement controls
         if (Keyboard.IsKeyPressed(Key.W))
             moveForce += forward * currentAcceleration;
         if (Keyboard.IsKeyPressed(Key.S))
@@ -193,21 +264,21 @@ public class PlayerController
         if (Keyboard.IsKeyPressed(Key.A))
             moveForce -= right * currentAcceleration;
 
-        // Only apply movement force if not facing a too-high step or moving away from it
-        if (!isStepTooHigh || Vector3.Dot(moveForce, lastMoveDirection) < 0)
+        // Apply movement force with step height consideration
+        if (!isStepTooHigh || Vector3.Dot(moveForce, lastMoveDirection) < 0 || isFlying)
         {
             movementVelocity += moveForce * dt;
         }
         else
         {
-            // If facing a too-high step, only allow movement perpendicular to the step
             Vector3 stepNormal = Vector3.Normalize(lastMoveDirection);
             Vector3 perpendicular = new Vector3(-stepNormal.Z, 0, stepNormal.X);
             float perpendicularComponent = Vector3.Dot(moveForce, perpendicular);
             movementVelocity += perpendicular * perpendicularComponent * dt;
         }
 
-        if (IsGrounded && moveForce.Length() == 0)
+        // Apply deceleration
+        if ((IsGrounded || isFlying) && moveForce.Length() == 0)
         {
             var decel = deceleration * dt;
             if (movementVelocity.Length() < decel)
@@ -220,14 +291,14 @@ public class PlayerController
             }
         }
 
-        // Clamp movement speed using current max speed
+        // Clamp movement speed
         if (movementVelocity.Length() > currentMaxSpeed)
         {
             movementVelocity = Vector3.Normalize(movementVelocity) * currentMaxSpeed;
         }
 
         // Apply friction to physics velocity when grounded
-        if (IsGrounded)
+        if (IsGrounded && !isFlying)
         {
             var friction = 0.1f;
             var horizontalPhysicsVel = physicsVelocity with { Y = 0 };
@@ -257,16 +328,15 @@ public class PlayerController
 
         Camera.Position = VisualPosition + new Vector3(0, playerHeight * currentHeightMultiplier, 0);
 
-        // Apply final velocity, taking into account step blocking
+        // Apply final velocity
         var combinedVelocity = physicsVelocity + movementVelocity;
         
-        // If facing a too-high step, remove the velocity component in the direction of the step
-        if (isStepTooHigh)
+        // Handle step blocking unless flying
+        if (isStepTooHigh && !isFlying)
         {
             Vector3 horizontalVelocity = combinedVelocity with { Y = 0 };
             if (Vector3.Dot(horizontalVelocity, lastMoveDirection) > 0)
             {
-                // Project velocity onto the plane perpendicular to lastMoveDirection
                 Vector3 perpendicular = new Vector3(-lastMoveDirection.Z, 0, lastMoveDirection.X);
                 float perpendicularComponent = Vector3.Dot(horizontalVelocity, perpendicular);
                 horizontalVelocity = perpendicular * perpendicularComponent;
@@ -276,6 +346,7 @@ public class PlayerController
 
         Position += combinedVelocity * dt;
 
+        // Update last move direction
         if (combinedVelocity.Length() > 0)
         {
             var horizontalVelocity = combinedVelocity with { Y = 0 };

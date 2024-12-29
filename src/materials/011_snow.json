@@ -1,0 +1,45 @@
+{
+    "name": "Snow",
+    "properties": {
+        "color1": {
+            "r": 0.65,
+            "g": 0.65,
+            "b": 0.9,
+            "controlPoint": 0.0
+        },
+        "color2": {
+            "r": 0.92,
+            "g": 0.92,
+            "b": 0.94,
+            "controlPoint": -1.0
+        },
+        "color3": {
+            "r": 0.98,
+            "g": 0.98,
+            "b": 1.0,
+            "controlPoint": -1.0
+        },
+        "color4": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "noiseSize": 0.1,
+        "noiseStrength": 0.4,
+        "texture1Id": 0,
+        "texture2Id": 0,
+        "textureBlend": 0.0,
+        "blendWithNoise": false,
+        "isPowder": true,
+        "isLiquid": false,
+        "isCollidable": true,
+        "roughness": 0.5,
+        "shininess": 0.3,
+        "specularStrength": 0.9,
+        "reflectivity": 0.01,
+        "transparency": 0.0,
+        "refractiveIndex": 1.1,
+        "emission": 0.0
+    }
+}

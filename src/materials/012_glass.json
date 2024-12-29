@@ -1,0 +1,45 @@
+{
+    "name": "Glass",
+    "properties": {
+        "color1": {
+            "r": 0.9,
+            "g": 1,
+            "b": 0.9,
+            "controlPoint": 0.0
+        },
+        "color2": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "color3": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "color4": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "controlPoint": -1.0
+        },
+        "noiseSize": 0.0,
+        "noiseStrength": 0.0,
+        "texture1Id": 0,
+        "texture2Id": 0,
+        "textureBlend": 0.0,
+        "blendWithNoise": false,
+        "isPowder": false,
+        "isLiquid": false,
+        "isCollidable": true,
+        "roughness": 0.01,
+        "shininess": 1.0,
+        "specularStrength": 2.0,
+        "reflectivity": 0.1,
+        "transparency": 0.99,
+        "refractiveIndex": 1.5,
+        "emission": 0.0
+    }
+}
