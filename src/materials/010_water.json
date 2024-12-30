@@ -9,15 +9,15 @@
         },
         "color2": {
             "r": 0.3,
-            "g": 0.6,
+            "g": 0.9,
             "b": 0.8,
-            "controlPoint": 0.5
+            "controlPoint": 1.0
         },
         "color3": {
             "r": 0.3,
             "g": 0.6,
-            "b": 1.0,
-            "controlPoint": 1.0
+            "b": 0.8,
+            "controlPoint": -1.0
         },
         "color4": {
             "r": 0.0,

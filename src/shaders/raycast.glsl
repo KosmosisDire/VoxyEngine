@@ -352,7 +352,7 @@ TraceResult traceSingleRay(Ray ray, int maxSteps) {
             vec3 blockOrig = clamp(chunkUV * float(BLOCK_SIZE), vec3(EPSILON), vec3(BLOCK_SIZE - EPSILON));
             DDAState blockDDA = initDDA(blockOrig, ray.direction, invDir);
 
-            while(steps < maxSteps && isInBounds(blockDDA.cell, ivec3(BLOCK_SIZE)) && hasVoxelsInDirection(cMask, ray.direction, blockDDA.cell))
+            while(steps < maxSteps && isInBounds(blockDDA.cell, ivec3(BLOCK_SIZE)))
             {    
                 int bIdx = getLocalIndex(blockDDA.cell);
 
@@ -482,7 +482,7 @@ TraceResult traceSingleRayIgnoreTransparent(Ray ray, int maxSteps) {
                         DDAState voxDDA = initDDA(voxOrig, ray.direction, invDir);
 
                         if (hasVoxelsInDirection(bMask, ray.direction, voxDDA.cell))
-                        while(steps < maxSteps && isInBounds(voxDDA.cell, ivec3(BLOCK_SIZE)))
+                        while(steps < maxSteps && isInBounds(voxDDA.cell, ivec3(BLOCK_SIZE)) && hasVoxelsInDirection(bMask, ray.direction, voxDDA.cell))
                         {
                             int vIdx = getLocalIndex(voxDDA.cell);
 
@@ -608,6 +608,10 @@ ShadowResult traceShadowRay(Ray ray, int maxSteps) {
                                                    voxelDDA.cell;
                                 vec3 hitPos = vec3(absoluteCell + voxelUVs) / float(CHUNK_SIZE);
                                 float dist = distance(startPos, hitPos);
+
+                                res.completelyBlocked = true;
+                                res.transmission = 0.0;
+                                return res;
 
                                 if (dist > ray.maxDist) {
                                     return res;

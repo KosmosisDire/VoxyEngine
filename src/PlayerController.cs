@@ -8,7 +8,7 @@ public class PlayerController
     public Vector3 physicsVelocity;
     public Vector3 movementVelocity;
     public Vector3 lastMoveDirection;
-    public float jumpImpulse = 2f;
+    public float jumpImpulse = 1.5f;
     public float acceleration = 8f;
     public float runAcceleration = 10f;
     public float deceleration = 20f;

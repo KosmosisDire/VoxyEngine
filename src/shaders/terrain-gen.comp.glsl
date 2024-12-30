@@ -8,7 +8,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 // Uniforms for chunk generation
 uniform int chunkIndex;
 uniform int chunkCount;
-const float noiseScale = 0.3;
+const float noiseScale = 0.35;
 
 bool genSolid(vec3 worldPos)
 {

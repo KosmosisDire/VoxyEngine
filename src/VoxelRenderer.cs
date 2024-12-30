@@ -254,7 +254,8 @@ public class VoxelRenderer : IDisposable
 
     bool clicked = false;
     public int selectedMaterial = 1; // from 1 to ChunkManager.Materials.Length - 1
-    public int placeSize = 4;
+    public int[] placeSizes = [1, 2, 4, 8, 16, 32];
+    public int placeSizeIndex = 2;
 
     public void Draw(double dt)
     {
@@ -268,6 +269,8 @@ public class VoxelRenderer : IDisposable
             hoveredCastResult = raycastSystem.Raycast(camera.Position, camera.Forward).hits[0];
 
             Vector3 cornerPos = hoveredCastResult.cellPosition;
+
+            int placeSize = placeSizes[placeSizeIndex];
 
             Vector3 size = new Vector3(placeSize, placeSize, placeSize);
             cornerPos = new Vector3(
@@ -297,40 +300,18 @@ public class VoxelRenderer : IDisposable
             }
 
             // if mouse wheel is scrolled, change selected material 
-            if (ctx.Input.Mice[0].ScrollWheels[0].Y != 0)
+            int scroll = (int)ctx.Input.Mice[0].ScrollWheels[0].Y;
+            if (scroll != 0)
             {
                 if (ctx.Input.Keyboards[0].IsKeyPressed(Key.ControlLeft))
                 {
-                    // move by powers of 2
-                    if ((int)ctx.Input.Mice[0].ScrollWheels[0].Y > 0)
-                    {
-                        placeSize *= 2;
-                    }
-                    else
-                    {
-                        placeSize /= 2;
-                    }
-
-                    if (placeSize < 1)
-                    {
-                        placeSize = 1;
-                    }
-                    if (placeSize > 1024)
-                    {
-                        placeSize = 1024;
-                    }
+                    placeSizeIndex += scroll;
+                    placeSizeIndex = Math.Clamp(placeSizeIndex, 0, placeSizes.Length);  
                 }
                 else
                 {
-                    selectedMaterial += (int)ctx.Input.Mice[0].ScrollWheels[0].Y;
-                    if (selectedMaterial < 1)
-                    {
-                        selectedMaterial = 1;
-                    }
-                    if (selectedMaterial >= Materials.materials.Length)
-                    {
-                        selectedMaterial = Materials.materials.Length - 1;
-                    }
+                    selectedMaterial += scroll;
+                    selectedMaterial = Math.Clamp(selectedMaterial, 0, Materials.materials.Length);
                 }
             }
 
@@ -347,7 +328,7 @@ public class VoxelRenderer : IDisposable
                 }
             }
 
-            DispatchSandSimulation(gl, dt);
+            // DispatchSandSimulation(gl, dt);
 
             uint workGroupsX = (uint)((currentSize.X + 15) / 16);
             uint workGroupsY = (uint)((currentSize.Y + 15) / 16);
