@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using Engine;
 using ImGuiNET;
 using Silk.NET.Input;
@@ -59,7 +59,7 @@ window.OnRender((dt) =>
     ImGui.Text($"Step Height: {player.currentStepHeight}");
     ImGui.Text($"Hovered Material: {Materials.GetMaterialName((int)voxelRenderer.hoveredCastResult.materialId)}");
     ImGui.Text($"Selected Material: {Materials.GetMaterialName(voxelRenderer.selectedMaterial)}");
-    ImGui.Text($"Place Size: {voxelRenderer.placeSize}");
+    ImGui.Text($"Place Size: {voxelRenderer.placeSizes[voxelRenderer.placeSizeIndex]}");
     ImGui.Separator();
     ImGui.Text($"FPS: {1.0/averageDt:F1}");
     ImGui.Text($"Frame Time: {averageDt * 1000:F1}ms");
