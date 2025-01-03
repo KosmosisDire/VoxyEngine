@@ -34,11 +34,11 @@
         "isPowder": false,
         "isLiquid": false,
         "isCollidable": true,
-        "roughness": 0.0,
+        "roughness": 0.1,
         "shininess": 0.4,
         "specularStrength": 0.3,
-        "reflectivity": 0.1,
-        "transparency": 0.1,
+        "reflectivity": 0.0,
+        "transparency": 0.0,
         "refractiveIndex": 1.1,
         "emission": 0.0
     }

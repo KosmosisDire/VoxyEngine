@@ -166,7 +166,8 @@ void main() {
         specular = specularStrength * spec * calculateSunColor(sunDir);
 
         // Final color calculation
-        finalColor = (albedo + specular) * (shadow + 0.5 / 2.0) * ao;
+        float shadowLight = (shadow + 0.5 / 2.0);
+        finalColor = (albedo + specular * shadowLight) * shadowLight * ao;
         
         // Apply tone mapping
         finalColor *= exposure;

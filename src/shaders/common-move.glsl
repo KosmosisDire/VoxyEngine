@@ -66,6 +66,33 @@ bool atomicCheckVoxel(ivec3 pos) {
     return (blockMasks[blockIndices.arrayIndex][blockIndices.uintIndex] & blockBit) != 0;
 }
 
+int getVoxelMaterial(ivec3 pos) {
+    // Check if position is valid
+    if (!isValidPosition(pos)) {
+        return -1;
+    }
+    
+    // First check if the voxel is occupied
+    if (!atomicCheckVoxel(pos)) {
+        return -1;
+    }
+    
+    // Calculate indices to get material
+    ivec3 chunkPos = pos / CHUNK_SIZE;
+    int chunkIndex = getChunkIndex(chunkPos);
+    ivec3 blockInChunk = (pos / BLOCK_SIZE) & (BLOCK_SIZE - 1);
+    int blockIndex = getLocalIndex(blockInChunk);
+    int globalBlockIndex = chunkIndex * (BLOCK_SIZE * BLOCK_SIZE * BLOCK_SIZE) + blockIndex;
+    ivec3 voxelInBlock = pos & (BLOCK_SIZE - 1);
+    int voxelIndex = getLocalIndex(voxelInBlock);
+    
+    // Get the global index for material lookup
+    int globalVoxelIndex = globalIndex(globalBlockIndex, voxelIndex);
+    
+    // Return the material
+    return int(getMaterial(globalVoxelIndex));
+}
+
 // Optimized voxel claim
 bool atomicClaimVoxel(ivec3 pos) {
     if (!isValidPosition(pos)) {
